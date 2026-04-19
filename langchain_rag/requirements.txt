@@ -1,0 +1,45 @@
+# Core LangChain
+langchain>=0.3.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+langchain-community>=0.3.0,<0.4.0
+langchain-text-splitters>=0.3.0,<0.4.0
+
+# DashScope (Qwen LLM + Embedding + Rerank)
+# ChatTongyi / DashScopeEmbeddings 在 langchain-community 内；
+# rerank 直接走 dashscope SDK
+dashscope>=1.20.0
+
+# 本地 HuggingFace Embedding（可选，仅在 EMBEDDING_PROVIDER=huggingface 时用到）
+langchain-huggingface>=0.1.0
+sentence-transformers>=3.0.0
+# 上面会自动带上 CPU 版 torch；
+# 如需 GPU 请先单独装 CUDA 版 torch，例如：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Vector store
+langchain-chroma>=0.1.4
+chromadb>=0.5.0
+
+# Hybrid retrieval (BM25)
+rank-bm25>=0.2.2          # langchain BM25Retriever 的底层依赖
+jieba>=0.42.1             # 中文分词，BM25 中文场景需要
+
+# 文档解析
+pypdf>=4.0.0              # PDF
+python-docx>=1.1.0        # DOCX
+docx2txt>=0.8             # langchain Docx2txtLoader 兼容
+unstructured>=0.15.0      # 通用 fallback（可选，体积较大）
+markdown>=3.5             # markdown -> 纯文本
+
+# Web service
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9   # /documents/upload 用 UploadFile 需要
+pydantic>=2.7.0
+pydantic-settings>=2.4.0
+
+# Web UI
+streamlit>=1.38.0
+
+# Misc
+python-dotenv>=1.0.1

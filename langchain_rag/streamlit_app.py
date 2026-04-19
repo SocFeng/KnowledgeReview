@@ -1,7 +1,7 @@
 """Streamlit Web UI：
 
 - 📤 文档管理：上传文件 → 解析切片 → 写入向量库；展示已入库文件 + 向量节点统计；
-  支持联动删除（删原始文件同时清理 Chroma + docstore 中对应节点）。
+  支持联动删除（删原始文件同时清理 Chroma + nodes.json 中对应节点）。
 - 💬 知识问答：基于已构建的知识库进行多轮对话，提供：
     * 检索范围多选（限定在选中的文件内检索）
     * 回答格式开关（简洁/详细/对比表格/步骤化）
@@ -35,16 +35,20 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-# 把噪音库的级别压回 WARNING
 for noisy in ("httpx", "httpcore", "urllib3", "chromadb", "sentence_transformers"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
-# 反过来：把 dashscope SDK 拉到 DEBUG，让 stream 失败时的真实错误能打印出来
 logging.getLogger("dashscope").setLevel(logging.DEBUG)
 
-from src.chat import Citation, STYLE_PROMPTS, get_chat_service  # noqa: E402
+from src.chat import (  # noqa: E402
+    Citation,
+    STYLE_PROMPTS,
+    get_chat_service,
+    reset_chat_service,
+)
 from src.config import get_settings  # noqa: E402
 from src.doc_store import bytes_sha1, get_doc_store, reset_doc_store  # noqa: E402
 from src.ingest import SUPPORTED_SUFFIXES, build_index_with_progress  # noqa: E402
+from src.retriever import reset_retriever  # noqa: E402
 from src.sessions import (  # noqa: E402
     StoredSession,
     dict_to_messages,
@@ -63,8 +67,8 @@ STYLE_LABELS = {
 }
 
 st.set_page_config(
-    page_title="LlamaIndex RAG 知识库管理",
-    page_icon="📚",
+    page_title="LangChain RAG 知识库管理",
+    page_icon="🧩",
     layout="wide",
 )
 
@@ -127,7 +131,6 @@ def _format_size(num_bytes: int) -> str:
 
 
 def _list_persisted_files(upload_dir: Path) -> List[Path]:
-    """扫描磁盘上已落盘的上传文件（按修改时间倒序）。"""
     if not upload_dir.exists():
         return []
     files = [
@@ -137,21 +140,26 @@ def _list_persisted_files(upload_dir: Path) -> List[Path]:
     return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def _reset_runtime_singletons() -> None:
+    """ingest / 删除文档后调用：让下一次问答用新的索引。"""
+    reset_doc_store()
+    reset_retriever()
+    reset_chat_service()
+
+
 # ---------- 页面 ----------
 def render_sidebar(cfg, page_key: str) -> None:
     with st.sidebar:
         st.header("📊 知识库状态")
         if st.button("🔄 刷新", use_container_width=True):
-            reset_doc_store()
+            _reset_runtime_singletons()
             st.rerun()
         st.metric("已索引向量数", _get_collection_count())
 
-        # 在 chat 页时，提供"回答风格 + 检索范围"两组开关
         if page_key == "chat":
             st.divider()
             st.subheader("⚙️ 对话设置")
             style_keys = list(STYLE_LABELS.keys())
-            # 确保默认值在选项里（防止旧 session_state 残留非法值）
             if st.session_state.get("answer_style") not in style_keys:
                 st.session_state["answer_style"] = "concise"
             st.radio(
@@ -166,7 +174,6 @@ def render_sidebar(cfg, page_key: str) -> None:
             st.divider()
             st.subheader("🎯 检索范围")
             doc_options = _list_doc_options()
-            # 校准 widget state：移除已被删除的文档名，避免 multiselect 报错
             cur = [d for d in (st.session_state.get("doc_filter") or [])
                    if d in doc_options]
             if cur != st.session_state.get("doc_filter"):
@@ -181,7 +188,12 @@ def render_sidebar(cfg, page_key: str) -> None:
         st.divider()
         st.subheader("当前配置")
         st.write(f"**LLM**：`{cfg.llm_model}`")
-        st.write(f"**Embedding**：`{cfg.embedding_model}`")
+        if cfg.embedding_provider == "huggingface":
+            st.write(f"**Embedding**：`HF: {cfg.hf_embedding_model}`")
+            st.write(f"**Device**：`{cfg.hf_embedding_device}`")
+        else:
+            st.write(f"**Embedding**：`{cfg.embedding_model}` (DashScope)")
+        st.write(f"**Rerank**：`{cfg.rerank_model}`")
         st.write(f"**切片**：`{cfg.chunk_size} / {cfg.chunk_overlap}`")
         st.write(f"**Chroma 路径**：`{cfg.chroma_dir}`")
         st.write(f"**Collection**：`{cfg.chroma_collection}`")
@@ -222,26 +234,17 @@ def render_upload_section() -> list:
 
 
 def render_persisted_files_section(cfg) -> None:
-    """展示 ``data/uploads/`` 下已经入库的文件列表。
-
-    每行附带：
-      - 文件大小、入库时间
-      - 在向量库中占多少节点
-      - 「🗑️ 联动删除」按钮：同时删除原始文件 + Chroma + docstore 中的节点
-    """
+    """展示 ``data/uploads/`` 下已经入库的文件列表，并支持联动删除 / 预览。"""
     st.subheader("📂 已上传文件")
     upload_dir = cfg.data_dir / "uploads"
     files = _list_persisted_files(upload_dir)
 
-    # 用 doc_store 拿"原始名 -> 节点统计"
     doc_store = get_doc_store()
     docs = doc_store.list_documents()
-    # 索引方式：既按 file_name 又按 original_name 都建索引，最大化命中
     stat_by_name: dict = {}
     for d in docs:
         if d.original_name:
             stat_by_name[d.original_name] = d
-        # 上传时落盘的实际文件名带 timestamp 前缀，也做索引
         if d.saved_path:
             stat_by_name[Path(d.saved_path).name] = d
 
@@ -254,14 +257,13 @@ def render_persisted_files_section(cfg) -> None:
         st.caption(f"向量库节点：**{total_nodes}** 个")
     with col_refresh:
         if st.button("🔄 刷新", use_container_width=True, key="refresh_files"):
-            reset_doc_store()
+            _reset_runtime_singletons()
             st.rerun()
 
     if not files and not docs:
         st.info("尚未上传任何文件。请在下方选择文件后点击『开始解析』。")
         return
 
-    # 1) 磁盘上的文件 + 节点数
     if files:
         total_size = sum(p.stat().st_size for p in files)
         st.caption(
@@ -317,7 +319,6 @@ def render_persisted_files_section(cfg) -> None:
                     _delete_file_and_vectors(p, file_hash)
                     st.rerun()
 
-    # 2) 向量库里有，但磁盘上没找到的"孤儿节点"——给一个清理按钮
     on_disk_keys = {p.name for p in files}
     orphans = [
         d for d in docs
@@ -335,12 +336,12 @@ def render_persisted_files_section(cfg) -> None:
             with col_del:
                 if st.button("🧹", key=f"orph_{d.file_hash}", help="清理向量库中的残留节点"):
                     deleted = get_doc_store().delete_by_hash(d.file_hash)
-                    reset_doc_store()
+                    _reset_runtime_singletons()
                     st.toast(f"已清理 {deleted} 个节点", icon="🧹")
                     st.rerun()
 
 
-def _read_file_preview(path: Path, max_chars: int = 50_000) -> tuple:
+def _read_file_preview(path: Path, max_chars: int = 50_000) -> tuple[str, str]:
     """读取文件用于预览。
 
     返回 ``(text, kind)``，``kind`` ∈ {``markdown``, ``text``, ``pdf``,
@@ -440,6 +441,7 @@ def _render_file_preview_panel() -> None:
             st.code(text, language="markdown")
         return
 
+    # text / pdf / docx 都按纯文本展示，方便复制
     label = {
         "text": "TXT 内容预览",
         "pdf": "PDF 文本预览（已逐页提取）",
@@ -454,7 +456,7 @@ def _render_file_preview_panel() -> None:
 
 
 def _delete_file_and_vectors(file_path: Path, file_hash: Optional[str]) -> None:
-    """联动删除：原始文件 + Chroma 中匹配节点 + docstore 中匹配节点。"""
+    """联动删除：原始文件 + Chroma 中匹配节点 + nodes.json 中匹配节点。"""
     file_deleted = False
     try:
         file_path.unlink()
@@ -466,7 +468,7 @@ def _delete_file_and_vectors(file_path: Path, file_hash: Optional[str]) -> None:
     if file_hash:
         try:
             nodes_deleted = get_doc_store().delete_by_hash(file_hash)
-            reset_doc_store()
+            _reset_runtime_singletons()
         except Exception as exc:  # noqa: BLE001
             st.warning(f"清理向量库节点失败：{exc}")
 
@@ -503,7 +505,6 @@ def render_ingest_section(uploaded_files: list, cfg) -> None:
     upload_dir = cfg.data_dir / "uploads"
 
     with st.status("正在处理…", expanded=True) as status:
-        # 阶段 0：保存文件 + 内容去重
         st.write("**Step 1/4** · 保存上传文件（按内容 hash 去重）")
         saved, original_names, dup_skipped = _save_uploaded_files(
             uploaded_files, upload_dir
@@ -526,7 +527,6 @@ def render_ingest_section(uploaded_files: list, cfg) -> None:
             return
         st.write(f"✅ 已保存 {len(saved)} 个新文件到 `{upload_dir}`")
 
-        # 进度组件
         st.write("**Step 2-4/4** · 加载 → 切片 → 生成向量")
         stage_label = st.empty()
         progress_bar = st.progress(0.0, text="准备中…")
@@ -555,7 +555,8 @@ def render_ingest_section(uploaded_files: list, cfg) -> None:
 
         status.update(label="✅ 解析完成", state="complete")
 
-    # 完成统计
+    _reset_runtime_singletons()
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("索引文件数", stats["files"])
     c2.metric("生成文本块", stats["nodes"])
@@ -568,11 +569,7 @@ def render_ingest_section(uploaded_files: list, cfg) -> None:
 
 # ---------- 对话页 ----------
 def _cite_pattern_replace(text: str, max_index: int, msg_id: str) -> str:
-    """把答案中的 ``[1]`` ``[2]`` 替换成可点击的 HTML anchor。
-
-    ``msg_id`` 用来给同一条消息内的引用编号生成唯一 anchor id，避免不同
-    回答之间的引用编号互相串扰。
-    """
+    """把答案中的 ``[1]`` ``[2]`` 替换成可点击的 HTML anchor。"""
     if not text or max_index <= 0:
         return text
 
@@ -598,10 +595,6 @@ def _render_assistant_message(
     msg_id: str,
     partial: bool = False,
 ) -> None:
-    """渲染一条 assistant 消息（正文 + 引用），把 [n] 处理成跳转链接。
-
-    若 ``partial=True``，会追加一个"已中断"徽章并提示用户回答可能不完整。
-    """
     rendered = _cite_pattern_replace(content or "", len(citations or []), msg_id)
     if partial:
         rendered += (
@@ -616,15 +609,6 @@ def _render_assistant_message(
 
 
 def _render_citations(citations, msg_id: str = "x") -> None:
-    """渲染引用片段。
-
-    兼容两种 citation 来源：
-    - 新生成的回答：``Citation`` dataclass 实例
-    - 从磁盘加载的历史：``dict``（来自 ``asdict``）
-
-    每条引用前面会加一个 ``<div id="cite-{msg_id}-{n}">`` 锚点，
-    供答案中的 ``[n]`` 链接跳转。
-    """
     if not citations:
         return
     with st.expander(f"📎 引用 {len(citations)} 个片段", expanded=False):
@@ -640,7 +624,6 @@ def _render_citations(citations, msg_id: str = "x") -> None:
                 file_name = c.file_name
                 text = c.text
             score = f"{score_v:.4f}" if score_v is not None else "-"
-            # anchor + 高亮样式（黄色背景的标题块）
             st.markdown(
                 f'<div id="cite-{msg_id}-{idx}" '
                 f'style="background:#fff7ed;border-left:4px solid #f59e0b;'
@@ -690,16 +673,9 @@ def _ensure_chat_state() -> None:
     if "chat_session_id" not in st.session_state:
         st.session_state.chat_session_id = None
     if "chat_messages" not in st.session_state:
-        # 每条 message: {
-        #   "role": "user|assistant", "content": str,
-        #   "citations": List[Citation|dict], "trace": Optional[RetrievalTrace],
-        #   "followups": List[str]
-        # }
         st.session_state.chat_messages = []
     if "chat_session_title" not in st.session_state:
         st.session_state.chat_session_title = ""
-    # selectbox 的 widget state 初始值（必须在 selectbox 首次渲染前设置，
-    # 否则后面就只能在 callback 里改）
     if "session_selector" not in st.session_state:
         st.session_state.session_selector = None
     if "answer_style" not in st.session_state:
@@ -708,20 +684,13 @@ def _ensure_chat_state() -> None:
         st.session_state.doc_filter = []
     if "session_search" not in st.session_state:
         st.session_state.session_search = ""
-    # 由"追问按钮"或"导入会话"等触发的下一轮自动问句
     if "pending_user_input" not in st.session_state:
         st.session_state.pending_user_input = None
-    # 控制重命名 popover 显示的临时缓存
     if "rename_buffer" not in st.session_state:
         st.session_state.rename_buffer = ""
 
 
 def _persist_current_session() -> None:
-    """把 ``st.session_state`` 里的当前对话写回磁盘。
-
-    会话标题策略：用户首条消息的前 20 字（如果还没设置过）；保留之前的
-    pinned / style 设置不被覆盖。
-    """
     sid = st.session_state.chat_session_id
     if not sid:
         return
@@ -755,12 +724,6 @@ def _persist_current_session() -> None:
 
 
 def _switch_to_session(sid: str) -> bool:
-    """切换到一个磁盘上已存在的会话：加载历史 + 恢复 engine memory。
-
-    注意：这里**不**修改 ``session_selector`` 这个 widget state——调用方
-    （selectbox 的 ``on_change`` 回调）已经先一步把它设成新值了，重复
-    赋值会触发 StreamlitAPIException。
-    """
     store = get_session_store()
     loaded = store.load(sid)
     if not loaded:
@@ -784,11 +747,6 @@ def _switch_to_session(sid: str) -> bool:
 
 
 def _start_new_session() -> None:
-    """开新会话：清空当前 UI 状态，并把旧 engine 释放。
-
-    注意：``session_selector`` widget state 的同步留给调用方处理
-    （只有 callback 能安全修改 widget state）。
-    """
     old_sid = st.session_state.chat_session_id
     if old_sid:
         try:
@@ -802,8 +760,6 @@ def _start_new_session() -> None:
 
 # ---------- selectbox / button callbacks ----------
 def _on_session_selector_change() -> None:
-    """selectbox 选项变化时的回调：值已经被写到 widget state 里了，
-    这里只负责把对应的对话状态切换/重建。"""
     selected = st.session_state.session_selector
     if selected == st.session_state.chat_session_id:
         return
@@ -811,19 +767,16 @@ def _on_session_selector_change() -> None:
         _start_new_session()
     else:
         if not _switch_to_session(selected):
-            # 加载失败 → 把 selectbox 拉回 None（callback 内部允许改 widget state）
             st.session_state.session_selector = None
             _start_new_session()
 
 
 def _on_new_session_clicked() -> None:
-    """『➕ 新建』按钮回调。"""
     _start_new_session()
     st.session_state.session_selector = None
 
 
 def _on_delete_session_clicked() -> None:
-    """『🗑️』按钮回调：删除当前会话的持久化文件，并重置为新会话。"""
     sid = st.session_state.chat_session_id
     if not sid:
         return
@@ -837,7 +790,6 @@ def _on_delete_session_clicked() -> None:
 
 
 def _on_followup_clicked(text: str) -> None:
-    """追问按钮点击：把追问文本塞到 pending_user_input，下次 rerun 自动当作输入触发。"""
     st.session_state.pending_user_input = text
 
 
@@ -884,13 +836,10 @@ def _import_session_from_upload(uploaded_file) -> None:
         st.error(f"导入失败：{exc}")
         return
     st.toast(f"已导入会话，ID `{new_sid[:8]}…`", icon="📥")
-    # 标记下一次渲染时自动切换到新会话；因为这里仍在 button 回调外，
-    # 直接改 chat_session_id 即可，让 render_chat_tab 顶部的同步逻辑接手。
     _switch_to_session(new_sid)
 
 
 def _format_session_label(sid: Optional[str], sessions) -> str:
-    """selectbox 用：把 session_id -> "📌 标题（n 条 · 时间）"。"""
     if sid is None:
         return "➕ 新建会话"
     meta = next((s for s in sessions if s.session_id == sid), None)
@@ -902,10 +851,8 @@ def _format_session_label(sid: Optional[str], sessions) -> str:
 
 
 def _render_session_toolbar(store, sessions, current_sid: Optional[str]) -> None:
-    """会话顶部工具栏：选择 / 新建 / 删除 / 重命名 / 固定 / 导出 / 导入。"""
     options = [None] + [s.session_id for s in sessions]
 
-    # 在 selectbox 实例化【之前】校准 widget state，避免 StreamlitAPIException
     if (st.session_state.session_selector is not None
             and st.session_state.session_selector not in options):
         st.session_state.session_selector = None
@@ -915,7 +862,6 @@ def _render_session_toolbar(store, sessions, current_sid: Optional[str]) -> None
         else:
             st.session_state.session_selector = None
 
-    # 第一行：选择 + 新建 + 删除
     col_sel, col_new, col_del = st.columns([6, 1, 1])
     with col_sel:
         st.selectbox(
@@ -944,7 +890,6 @@ def _render_session_toolbar(store, sessions, current_sid: Optional[str]) -> None
             key="del_session_btn",
         )
 
-    # 第二行：搜索 + 重命名 + 固定 + 导出 + 导入
     col_search, col_rename, col_pin, col_export_md, col_export_json, col_import = (
         st.columns([4, 1, 1, 1, 1, 2])
     )
@@ -1035,14 +980,11 @@ def _render_session_toolbar(store, sessions, current_sid: Optional[str]) -> None
 def render_chat_tab() -> None:
     _ensure_chat_state()
     store = get_session_store()
-    # 列表 + 搜索过滤
     sessions = store.list(query=st.session_state.session_search)
     current_sid = st.session_state.chat_session_id
 
-    # ----- 会话管理栏 -----
     _render_session_toolbar(store, sessions, current_sid)
 
-    # 当前会话信息行
     cur_title = st.session_state.chat_session_title or "(尚未保存)"
     cur_id_short = (current_sid[:8] + "…") if current_sid else "尚未生成"
     style_label = STYLE_LABELS.get(st.session_state.answer_style, st.session_state.answer_style)
@@ -1055,12 +997,10 @@ def render_chat_tab() -> None:
 
     st.divider()
 
-    # 提示：是否有可用知识库
     if _get_collection_count() == 0:
         st.info("当前向量库为空，请先在左侧「📤 文档管理」页面上传文档并解析。")
         return
 
-    # 历史消息渲染（assistant 部分用富渲染：引用跳转 + trace 面板 + 追问）
     for i, msg in enumerate(st.session_state.chat_messages):
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
@@ -1075,7 +1015,6 @@ def render_chat_tab() -> None:
             else:
                 st.markdown(msg["content"])
 
-    # 输入框 / 追问按钮触发的输入
     pending = st.session_state.pending_user_input
     if pending:
         user_input = pending
@@ -1086,38 +1025,24 @@ def render_chat_tab() -> None:
     if not user_input:
         return
 
-    # 立刻显示用户消息
     st.session_state.chat_messages.append(
         {"role": "user", "content": user_input, "citations": []}
     )
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # ----- 调用后端（流式 + 检索范围 + 风格）-----
-    # 关键：先 append 一个 placeholder assistant message，再开始 stream；
-    # 流式期间把每个 token 实时写入 placeholder["content"]。这样即便用户
-    # 在 streamlit 右上角点了 Stop（会抛 RerunException/StopException），
-    # 已经生成的 partial 内容也会留在 chat_messages 里 + 持久化到磁盘。
     placeholder: Optional[dict] = None
     collected: List[str] = []
     completed = False
 
     with st.chat_message("assistant"):
-        # 顶部一行：左侧状态文字（思考中/回答中），右侧"⏹ 停止"按钮。
-        # 关键机制：流式期间用户点击此按钮 → Streamlit 接收到 widget 交互
-        # 事件 → 在 stream 的下一次 streamlit API 调用处抛出 RerunException
-        # → 我们的 finally 块把已收到的 partial 内容落盘 → 新一轮 run 时
-        # 历史渲染那条 partial 消息会带"⏹ 已中断"徽章。
-        # 这里 button 的返回值我们不直接读——按钮的"被点击"这个动作本身
-        # 就是中断信号；点击会被 streamlit 转化为 rerun，自然中断当前流。
         head_cols = st.columns([0.78, 0.22])
         with head_cols[0]:
             status_box = st.empty()
         with head_cols[1]:
-            stop_slot = st.empty()  # stream 之前 fill；正常完成后 .empty()
+            stop_slot = st.empty()
 
         try:
-            # ---- 1. 先做检索（拿到 handle），失败要撤回 user msg ----
             try:
                 service = get_chat_service()
                 status_box.markdown("🔎 **正在检索知识库…**")
@@ -1130,7 +1055,7 @@ def render_chat_tab() -> None:
             except FileNotFoundError as exc:
                 status_box.empty()
                 st.error(str(exc))
-                st.session_state.chat_messages.pop()  # 撤回 user
+                st.session_state.chat_messages.pop()
                 return
             except Exception as exc:
                 status_box.empty()
@@ -1139,7 +1064,6 @@ def render_chat_tab() -> None:
                 st.session_state.chat_messages.pop()
                 return
 
-            # ---- 2. 追加 assistant placeholder + 渲染停止按钮 ----
             placeholder = {
                 "role": "assistant",
                 "content": "",
@@ -1150,7 +1074,6 @@ def render_chat_tab() -> None:
             }
             st.session_state.chat_messages.append(placeholder)
             status_box.markdown("🤔 **AI 正在思考…**")
-            # 停止按钮：仅在 stream 期间存在；点击会触发 rerun → 中断当前流
             stop_slot.button(
                 "⏹ 停止",
                 key="stop_streaming_btn",
@@ -1159,7 +1082,6 @@ def render_chat_tab() -> None:
                 help="停止当前回答（已生成的内容会保留）",
             )
 
-            # ---- 3. 流式生成（每个 token 同步写回 placeholder）----
             def _status_iter():
                 first = True
                 for token in handle.token_iter:
@@ -1173,9 +1095,8 @@ def render_chat_tab() -> None:
 
             full_text = st.write_stream(_status_iter()) or ""
             status_box.empty()
-            stop_slot.empty()  # 正常完成 → 立刻收掉停止按钮
+            stop_slot.empty()
 
-            # ---- 4. 收尾：finalize → 替换 placeholder ----
             result = handle.finalize()
             st.session_state.chat_session_id = result.session_id
 
@@ -1190,7 +1111,6 @@ def render_chat_tab() -> None:
             })
             completed = True
 
-            # ---- 5. 追问建议（独立 try，失败不影响主流程）----
             try:
                 with st.spinner("生成追问建议…"):
                     placeholder["followups"] = service.suggest_followups(
@@ -1200,17 +1120,12 @@ def render_chat_tab() -> None:
                 placeholder["followups"] = []
 
         finally:
-            # 不管完成还是被中断（streamlit stop / 异常），都尝试把当前
-            # 状态写到磁盘。这一段必须能容忍 placeholder is None 的情况
-            # （检索阶段就失败了，return 前 placeholder 还没创建）。
             if placeholder is not None and not completed:
                 partial = "".join(collected).strip()
                 if partial:
                     placeholder["content"] = partial
                     placeholder["partial"] = True
                 else:
-                    # 一个 token 都没生成 → 把 placeholder + user 一并撤回，
-                    # 避免下次刷新看到一对孤立的"提问 + 空回答"
                     try:
                         if (st.session_state.chat_messages
                                 and st.session_state.chat_messages[-1] is placeholder):
@@ -1226,17 +1141,12 @@ def render_chat_tab() -> None:
                 pass
 
     if not completed:
-        # 走到这里说明被中断/出错（partial 已经在 finally 落盘），
-        # 不需要再 st.rerun()，让 streamlit 完成本轮即可
         return
 
-    # 答完且未中断 → rerun 让新消息走"历史消息渲染"路径，
-    # 这样引用跳转锚点 / 追问按钮 / trace 面板才会真正显示出来
     st.rerun()
 
 
 def _render_followups(followups: List[str], msg_idx: int) -> None:
-    """追问按钮组：3 个候选问句，点击直接发出。"""
     if not followups:
         return
     st.caption("💡 你可能还想问：")
@@ -1290,9 +1200,8 @@ def main() -> None:
         st.exception(exc)
         st.stop()
 
-    # 侧边栏：页面路由 + 知识库状态
     with st.sidebar:
-        st.title("📚 LlamaIndex × Qwen")
+        st.title("🧩 LangChain × Qwen")
         st.caption("知识库管理")
         page_label = st.radio(
             "页面导航",

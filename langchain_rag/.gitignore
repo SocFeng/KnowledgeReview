@@ -1,0 +1,23 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# 敏感配置（保留 .env.example 作为模板）
+.env
+.env.local
+
+# 持久化产物（向量库、节点快照、会话记录、上传文件）
+storage/
+data/uploads/
+data/chat_history/
+
+# 日志 / 临时
+*.log
+*.tmp
+.DS_Store
