@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# 索引持久化目录与原始数据（如不希望上传可保留以下两行）
+storage/
+data/*
+!data/.gitkeep
+!data/README.md

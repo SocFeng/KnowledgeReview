@@ -1,0 +1,44 @@
+# Core
+llama-index>=0.12.0,<0.13.0
+llama-index-core>=0.12.0,<0.13.0
+
+# DashScope (Qwen LLM + Embedding + Rerank)
+llama-index-llms-dashscope>=0.3.0
+llama-index-embeddings-dashscope>=0.3.0
+llama-index-postprocessor-dashscope-rerank>=0.3.0
+dashscope>=1.20.0
+
+# 本地 HuggingFace Embedding（可选，仅在 EMBEDDING_PROVIDER=huggingface 时用到）
+# 注意：必须 <0.6，否则会强制升级 llama-index-core 到 0.13+，
+#       与 dashscope 系列包 (要求 core<0.13) 冲突
+llama-index-embeddings-huggingface>=0.4.0,<0.6.0
+sentence-transformers>=3.0.0
+# 以上会自动带上 CPU 版 torch；
+# 如需 GPU 请先单独装 CUDA 版 torch，例如：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Vector store
+llama-index-vector-stores-chroma>=0.4.0
+chromadb>=0.5.0
+
+# Hybrid retrieval (BM25)
+llama-index-retrievers-bm25>=0.5.0
+jieba>=0.42.1            # 中文分词，BM25 中文场景需要
+
+# File readers (PDF / DOCX / etc.)
+llama-index-readers-file>=0.4.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+
+# Web service
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9   # /documents/upload 用 UploadFile 需要
+pydantic>=2.7.0
+pydantic-settings>=2.4.0
+
+# Web UI
+streamlit>=1.38.0
+
+# Misc
+python-dotenv>=1.0.1

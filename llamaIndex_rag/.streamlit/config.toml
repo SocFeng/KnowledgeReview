@@ -1,0 +1,13 @@
+# 关掉文件监视器 —— 否则 streamlit 扫描 transformers/llama_index 等大型库时
+# 会反复触发未安装可选依赖（torchvision 等）的 ImportError，污染日志。
+# 代价：改了源码不会自动 reload，需要手动重启。
+[server]
+fileWatcherType = "none"
+
+# 应用自己的 INFO 日志在 streamlit_app.py 顶部用 logging.basicConfig 打开
+[logger]
+level = "info"
+
+# 默认浏览器自动打开，可按需关闭
+[browser]
+gatherUsageStats = false
