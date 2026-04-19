@@ -1,41 +1,62 @@
-# KnowledgeReview · RAG 双实现对比项目
+# KnowledgeReview · 大模型应用实战合集
 
-> 一个用 **同一份需求** 分别基于 **LlamaIndex** 与 **LangChain** 完整复刻一遍的
-> RAG（Retrieval-Augmented Generation）项目。两套实现功能完全对齐，便于对比
-> 两个主流框架在工程化、可控性、抽象代价上的差异，是学习 RAG 的好素材。
+> 三个独立可跑、互相参考的 **LLM 应用样板**，覆盖当下两大主流范式：
+> **RAG**（检索增强生成，"问知识库"）与 **Agent**（工具调用，"调外部世界"）。
+>
+> 全部基于阿里云百炼 **Qwen / DashScope**，全部在 **Windows + Python 3.11** 下踩过坑，
+> 每个子项目都附 `README.md`（怎么用）+ `LEARNING.md`（为什么这样设计）。
+>
+> 适合作为：**学习样本** / **框架对比** / **可二次开发的脚手架**。
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                          KnowledgeReview                       │
-│                                                                │
-│   ┌──────────────────────┐        ┌──────────────────────┐     │
-│   │   llamaIndex_rag/    │   vs   │    langchain_rag/    │     │
-│   │  （LlamaIndex 实现）  │        │   （LangChain 实现）   │     │
-│   └──────────────────────┘        └──────────────────────┘     │
-│             │                              │                   │
-│             └─────────── 同一套 ───────────┘                    │
-│                  Qwen + DashScope                              │
-│                  ChromaDB + jieba BM25                         │
-│                  gte-rerank-v2                                 │
-│                  FastAPI + Streamlit                           │
-└────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            KnowledgeReview                              │
+│                                                                         │
+│   ┌────────────────────┐  ┌────────────────────┐  ┌──────────────────┐  │
+│   │  llamaIndex_rag/   │  │   langchain_rag/   │  │ langChain_       │  │
+│   │  RAG · LlamaIndex  │  │  RAG · LangChain   │  │ langGraph_agent/ │  │
+│   │                    │  │                    │  │ Agent · LangGraph│  │
+│   └─────────┬──────────┘  └─────────┬──────────┘  └────────┬─────────┘  │
+│             │ 同一份需求 · 两套实现 │                       │            │
+│             └──────── RAG ──────────┘                       │            │
+│                                                             ↓            │
+│                                                       Agent + Tools      │
+│                                                                         │
+│              共同底座：Qwen via DashScope · Streamlit UI                │
+│              RAG 专用：ChromaDB · jieba BM25 · gte-rerank-v2            │
+│              Agent 专用：LangGraph StateGraph · 自定义 Tools            │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 1. 项目特点
 
-✅ **同一份需求、两套实现**：可以直接对比两个框架在同一问题上的代码差异
-✅ **功能完全对齐**：上传、检索、对话、引用、召回可视化、追问建议、会话管理…… 一个都不少
-✅ **生产级细节**：去重、联动删除、流式 fallback、API key 全局补丁、可观测 trace
-✅ **完整的学习材料**：每个项目都有 README（用法）+ LEARNING.md / docs（原理）
-✅ **国产模型友好**：直接走阿里云百炼 DashScope（Qwen LLM、text-embedding、gte-rerank）
+✅ **覆盖两大 LLM 应用范式**：RAG（封闭世界问答）+ Agent（开放世界工具调用）
+✅ **同一份需求、两套 RAG 实现**：直接对比 LangChain vs LlamaIndex 两个主流框架的工程取舍
+✅ **生产级细节**：去重、联动删除、流式 fallback、API key 全局补丁、checkpointer 持久化、可观测 trace …… 全都已踩过坑
+✅ **完整的学习材料**：每个项目都有用法 README + 深度 LEARNING.md（含实战练习题）
+✅ **国产模型友好**：直接走阿里云百炼 DashScope（Qwen LLM、text-embedding、gte-rerank）；Embedding 可换本地 HuggingFace BGE
+✅ **零隐藏依赖**：Agent 项目优先免费无 key 数据源（Open-Meteo / Wikipedia / OSM），高德 Key 可选
 
 ---
 
-## 2. 共同的功能清单
+## 2. 三个子项目一览
 
-下面这些能力两个子项目都实现了：
+| 子项目 | 范式 | 框架 | 核心能力 | 适合谁读 |
+|---|---|---|---|---|
+| `llamaIndex_rag/` | **RAG** | LlamaIndex 0.11+ | 文档问答 / 多轮对话 / 混合检索 + Rerank | 想快速搭原型、喜欢"高抽象、少代码"的开发者 |
+| `langchain_rag/` | **RAG** | LangChain 0.3+ | 同上，功能 1:1 对齐 | 想深入理解 RAG 内部、喜欢"低抽象、全可控"的开发者 |
+| `langChain_langGraph_agent/` | **Agent** | LangChain + LangGraph | 智能旅游规划：自动调用天气 / 地理 / 景点 / 文化 / 路线工具 | 想学会写 Agent、ReAct loop、Tool calling 的开发者 |
+
+> 三个项目**完全独立**：各自的 venv、`.env`、`storage/` / `data/` 都不共享。
+> 想看哪个直接 `cd` 进去即可。
+
+---
+
+## 3. RAG 子项目能力清单
+
+`llamaIndex_rag/` 和 `langchain_rag/` 两个 RAG 项目功能完全对齐：
 
 | 类别 | 能力 |
 |---|---|
@@ -55,11 +76,7 @@
 | 🌐 REST API | FastAPI，自带 `/docs` Swagger 页面 |
 | 🖥️ Web UI | Streamlit，上传 → 解析 → 问答 全流程 |
 
----
-
-## 3. 两套实现的差异
-
-> 功能 1:1，但因为框架抽象不同，代码长相和工程权衡有差异。
+### 两套 RAG 实现的差异
 
 | 维度 | `llamaIndex_rag/` | `langchain_rag/` |
 |---|---|---|
@@ -78,61 +95,105 @@
 
 ---
 
-## 4. 仓库地图
+## 4. Agent 子项目（`langChain_langGraph_agent/`）
+
+> 用 **LangChain + LangGraph + 自定义工具** 实现的中文**智能旅游规划助手**。
+> 用户用聊天对话告诉 Agent 出发地、目的地、出行天数、偏好，
+> Agent 会自动调用天气 / 地理 / 景点 / 文化 / 路线等工具，
+> 整合成可随时修改的 Markdown 行程方案。
+
+### 4.1 能力清单
+
+| 类别 | 能力 |
+|---|---|
+| 🤖 Agent 框架 | **LangGraph StateGraph** 手写 ReAct loop（不是 prebuilt 的 `create_react_agent` 黑盒） |
+| 🛠 自定义工具 | 6 个**全部自实现**：地理编码 / 天气 / 距离 / 景点 / 文化 / 路线 |
+| 🌐 数据源策略 | 优先**免费无 key**（Open-Meteo / Wikipedia / OSM），可选高德地图增强 |
+| 💬 类聊天 UI | Streamlit 多会话切换、重命名、删除 |
+| 🧠 持久化记忆 | LangGraph **SqliteSaver checkpointer**，跨进程也能续聊 |
+| 🔧 可观测 | 工具调用 trace 实时展开（参数 + 返回 JSON） |
+| 🔁 上下文修改 | 用户随时改需求（"再加一天"、"去掉博物馆"），Agent 基于历史增量调整 |
+| 🇨🇳 中文 LLM | DashScope Qwen 系列（`qwen-plus` / `qwen-max` / ...） |
+
+### 4.2 核心知识点（`LEARNING.md` 已详解）
+
+- **Agent vs Chain 的本质区别**：流程是写死还是 LLM 决策
+- **ReAct 框架**：Reason → Act → Observe 循环，靠 tool calling 协议落地
+- **LangGraph StateGraph**：节点 / 条件边 / cycle，区别于 LangChain 普通 DAG
+- **`@tool` 装饰器**：函数 → JSON Schema → LLM 可见
+- **`bind_tools()`**：让 ChatTongyi 兼容 OpenAI tool calling 协议
+- **State + add_messages reducer**：多节点写同字段时合并而非覆盖
+- **Checkpointer 持久化**：thread_id 隔离会话、跨进程续聊
+- **Tool 失败哲学**：永不抛异常，返回 `{"error": "..."}` 让 LLM 自行换路
+- **多源 fallback 排序**：怎么避免"北京"被 Open-Meteo 解析到重庆某村镇
+
+---
+
+## 5. 仓库地图
 
 ```
 KnowledgeReview/
 │
-├── README.md                        ← 本文（总览导航）
+├── README.md                            ← 本文（总览导航）
 │
-├── llamaIndex_rag/                  ← 实现 1：基于 LlamaIndex
-│   ├── README.md                    用法说明 / 快速启动
-│   ├── docs/项目学习指南.md          原理讲解 / 设计决策
-│   ├── src/                         核心模块
-│   ├── scripts/                     命令行入口
-│   ├── streamlit_app.py             Web UI
+├── llamaIndex_rag/                      ← 实现 1：RAG · LlamaIndex
+│   ├── README.md                        用法说明 / 快速启动
+│   ├── docs/项目学习指南.md              原理讲解 / 设计决策
+│   ├── src/                             核心模块
+│   ├── scripts/                         命令行入口
+│   ├── streamlit_app.py                 Web UI
 │   ├── requirements.txt
 │   └── .env.example
 │
-└── langchain_rag/                   ← 实现 2：基于 LangChain
-    ├── README.md                    用法说明 / 快速启动
-    ├── LEARNING.md                  ⭐ 学习路径文档（10 节、~700 行）
-    ├── src/                         核心模块
-    │   ├── config.py                配置中心
-    │   ├── settings.py              LLM / Embedding 工厂
-    │   ├── doc_store.py             文档级元数据 + nodes.json
-    │   ├── ingest.py                摄入管线
-    │   ├── retriever.py             混合检索 + RRF + Rerank
-    │   ├── chat.py                  多轮对话
-    │   ├── sessions.py              会话持久化
-    │   └── api.py                   FastAPI 路由
-    ├── scripts/                     命令行入口
-    │   ├── ingest.py
-    │   ├── run_api.py
-    │   ├── ask_once.py
-    │   └── diagnose.py              ⭐ 强烈推荐先跑这个体检
-    ├── streamlit_app.py             Web UI
+├── langchain_rag/                       ← 实现 2：RAG · LangChain
+│   ├── README.md                        用法说明 / 快速启动
+│   ├── LEARNING.md                      ⭐ 学习路径文档（10 节、~700 行）
+│   ├── src/                             核心模块（config / settings / doc_store / ingest / retriever / chat / sessions / api）
+│   ├── scripts/                         命令行入口（含 diagnose 体检脚本）
+│   ├── streamlit_app.py                 Web UI
+│   ├── requirements.txt
+│   └── .env.example
+│
+└── langChain_langGraph_agent/           ← 实现 3：Agent · LangChain + LangGraph
+    ├── README.md                        用法说明 / 快速启动
+    ├── LEARNING.md                      ⭐ 学习路径文档（12 节、~970 行，标注全部 Agent 知识点）
+    ├── src/
+    │   ├── config.py                    配置中心
+    │   ├── llm.py                       ChatTongyi 工厂
+    │   ├── prompts.py                   System Prompt（含工作流约束）
+    │   ├── state.py                     LangGraph State + add_messages
+    │   ├── agent.py                     ⭐⭐ StateGraph 编排：手写 ReAct loop + checkpointer
+    │   └── tools/                       6 个自定义工具
+    │       ├── geocode.py / weather.py / distance.py
+    │       └── attractions.py / culture.py / route.py
+    ├── scripts/
+    │   ├── diagnose.py                  ⭐ 一键体检：配置 → LLM → 6 个工具
+    │   └── chat_cli.py                  命令行版对话
+    ├── streamlit_app.py                 Web UI（多会话 + 工具 trace）
     ├── requirements.txt
     └── .env.example
 ```
 
 ---
 
-## 5. 快速开始（任选其一）
+## 6. 快速开始
 
-> 两个子项目相互独立，各自有自己的虚拟环境、`.env`、`storage/`。
+> 三个子项目相互独立，各自有自己的虚拟环境、`.env`、数据目录。
 
-### 5.1 选择子项目
+### 6.1 选择子项目
 
 ```powershell
-# 选 LangChain 版（推荐学习用）
+# 选 RAG · LangChain（推荐学习 RAG 用）
 cd langchain_rag
 
-# 或选 LlamaIndex 版
+# 或选 RAG · LlamaIndex
 cd llamaIndex_rag
+
+# 或选 Agent · LangGraph（推荐学习 Agent 用）
+cd langChain_langGraph_agent
 ```
 
-### 5.2 创建虚拟环境（Python 3.11 推荐）
+### 6.2 创建虚拟环境（Python 3.11 推荐）
 
 ```powershell
 python -m venv .venv
@@ -140,7 +201,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 5.3 配置 API Key
+### 6.3 配置 API Key
 
 ```powershell
 copy .env.example .env
@@ -148,27 +209,28 @@ copy .env.example .env
 ```
 
 > 在 [阿里云百炼](https://bailian.console.aliyun.com/) 控制台申请 DashScope API Key。
+> Agent 项目还可选填 [高德地图](https://console.amap.com/dev/key/app) Web 服务 Key（不填也能跑，会 fallback 到免费数据源）。
 
-### 5.4 自检（仅 langchain_rag 提供）
+### 6.4 自检（langchain_rag 和 Agent 项目都有）
 
 ```powershell
-python scripts\diagnose.py
+python -m scripts.diagnose
 ```
 
-会逐项验证 配置 → Embedding → LLM → Rerank 是否可用。任何一项失败都会给出可操作的提示。
+会逐项验证 配置 → LLM → Embedding/Rerank（RAG）或 6 个工具（Agent）是否可用。任何一项失败都给出可操作的提示。
 
-### 5.5 起 Web UI
+### 6.5 起 Web UI
 
 ```powershell
 streamlit run streamlit_app.py
 ```
 
-打开浏览器访问 `http://localhost:8501`：
+打开浏览器 `http://localhost:8501`：
 
-1. **📤 文档管理** 页：上传 PDF/MD/TXT/DOCX → 解析入库 → 可点击文件名预览
-2. **💬 知识问答** 页：基于已入库内容多轮对话，附引用、召回 trace、追问建议
+- **RAG 项目**：📤 文档管理 → 上传 PDF/MD/TXT/DOCX；💬 知识问答 → 基于已入库内容多轮对话
+- **Agent 项目**：💬 直接聊天，告诉它出发地/目的地/天数/偏好，看它自动调工具规划行程
 
-### 5.6 起 REST API（可选）
+### 6.6 起 REST API（仅 RAG 项目，可选）
 
 ```powershell
 python -m scripts.run_api
@@ -178,13 +240,13 @@ python -m scripts.run_api
 
 ---
 
-## 6. 推荐学习路径
+## 7. 推荐学习路径
 
-如果你是来"学习 RAG 是怎么实现的"：
+### 路径 A：想学懂 RAG
 
 ```
 Step 1  先跑通 langchain_rag
-        ├─ 按 §5 起 Streamlit
+        ├─ 按 §6 起 Streamlit
         ├─ 上传一份你熟悉的资料
         └─ 提几个问题，观察"召回详情"面板里 4 阶段的命中变化
 
@@ -198,67 +260,109 @@ Step 3  对比 llamaIndex_rag 的同名模块
         ├─ 哪些地方变短了？哪些地方"看不见"了？
         └─ 哪种你更喜欢？为什么？
 
-Step 4  做 LEARNING.md §8 的实战练习题
-        从 Level 1（读懂）→ Level 4（深入）渐进
+Step 4  做 LEARNING.md §8 的实战练习题（Level 1 → Level 4）
 ```
 
-如果你只是想"用一个本地知识库"：
+### 路径 B：想学懂 Agent
 
-- 直接按 §5 跑 Web UI 即可，挑哪个版本都行
+```
+Step 1  先跑通 langChain_langGraph_agent
+        ├─ 按 §6 起 Streamlit
+        ├─ 输入"我想周末从北京去天津玩 1 天，喜欢历史"
+        └─ 观察工具 trace，看 Agent 怎么自己决定调哪些工具
+
+Step 2  阅读 langChain_langGraph_agent/LEARNING.md
+        ├─ §3 从 Chain 到 Agent + ReAct 框架
+        ├─ §4 模块走读：尤其是 agent.py 的图结构
+        └─ §5 Tool Calling 协议深入 + §6 记忆机制
+
+Step 3  做 LEARNING.md §9 实战练习
+        ├─ Level 1：改 should_continue / state / prompt 看会发生什么
+        ├─ Level 2：自己加一个 currency 工具
+        └─ Level 4：尝试 Agent + RAG 融合
+```
+
+### 路径 C：想全面掌握 LLM 工程
+
+```
+RAG（路径 A） → Agent（路径 B） → 阅读 Agent LEARNING.md §10 与 RAG 的对比
+
+最后挑战 §9 Level 4：把 Agent 的"文化背景"工具改成调 langchain_rag 项目的检索器
+        → 这就是真实生产里 Agent + RAG 的标准融合方式
+```
+
+### 路径 D：只想用，不想学
+
+直接按 §6 跑任意一个 Web UI 即可。三个 Streamlit 都开箱可用。
 
 ---
 
-## 7. 技术栈一览
+## 8. 技术栈一览
 
-| 类别 | 选型 |
-|---|---|
-| 语言 | Python 3.11 |
-| RAG 框架 | LlamaIndex 0.11+ / LangChain 0.3+（两个独立实现） |
-| LLM 平台 | 阿里云百炼 DashScope |
-| LLM 模型 | Qwen 系列（qwen-plus / qwen-max 等） |
-| Embedding | DashScope `text-embedding-v3` 或 HuggingFace BGE |
-| Rerank | DashScope `gte-rerank-v2` |
-| 向量库 | ChromaDB |
-| 关键词检索 | rank-bm25 + jieba |
-| API | FastAPI + Uvicorn |
-| Web UI | Streamlit |
-| 配置管理 | pydantic-settings |
-| 文档加载 | pypdf / python-docx / docx2txt |
+| 类别 | RAG 项目选型 | Agent 项目选型 |
+|---|---|---|
+| 语言 | Python 3.11 | Python 3.11 |
+| 主框架 | LlamaIndex 0.11+ / LangChain 0.3+ | LangChain 0.3+ + **LangGraph 0.2+** |
+| LLM 平台 | 阿里云百炼 DashScope | 同左 |
+| LLM 模型 | Qwen 系列（qwen-plus / qwen-max） | 同左 |
+| Embedding | DashScope `text-embedding-v3` 或 HuggingFace BGE | — |
+| Rerank | DashScope `gte-rerank-v2` | — |
+| 向量库 | ChromaDB | — |
+| 关键词检索 | rank-bm25 + jieba | — |
+| 工具数据源 | — | Open-Meteo / Wikipedia / OSM Nominatim / 高德（可选） |
+| 状态 / 记忆 | 自维护 chat_history JSON | **LangGraph SqliteSaver checkpointer** |
+| API | FastAPI + Uvicorn | — |
+| Web UI | Streamlit | Streamlit |
+| 配置管理 | pydantic-settings | pydantic-settings |
+| 文档加载 | pypdf / python-docx / docx2txt | — |
 
 ---
 
-## 8. 项目意图
+## 9. 项目意图
 
-这个仓库的目标**不是**"再造一个开源 RAG 工具"——市面上 LangChain、LlamaIndex 自己的官方 examples 已经够多。
+这个仓库的目标**不是**"再造一套开源工具"——LangChain、LlamaIndex、LangGraph 自己的官方 examples 已经够多。
 
 它的目标是：
 
-1. **作为学习样本**：帮助理解一个真正能用的 RAG 系统由哪些模块组成、各模块边界在哪
-2. **作为框架对比**：在同一份需求下看两个主流框架的工程取舍
-3. **作为可二次开发的脚手架**：所有"生产级细节"都已踩过坑、代码里有注释说明，可以直接 fork 改成你自己的内部知识库
+1. **作为学习样本**：帮助理解一个真正能用的 RAG / Agent 系统由哪些模块组成、各模块边界在哪
+2. **作为框架对比**：在同一份需求下看 LangChain vs LlamaIndex 的工程取舍；在 RAG vs Agent 的世界观差异中体会"封闭世界 vs 开放世界"
+3. **作为可二次开发的脚手架**：所有"生产级细节"都已踩过坑、代码里有注释说明，可以直接 fork 改成你自己的内部应用：
+   - RAG → 公司内部知识库 / 法律咨询助手 / 产品手册问答
+   - Agent → 智能客服 / 报销助手 / 数据分析 bot / 代码评审
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
-**Q: 两个子项目的数据/索引能共用吗？**
-A: 不能。它们各自维护 `storage/chroma/` 和 `data/`，相互独立。即便切到同一个 embedding 模型，存储格式细节也有差异。
+**Q: RAG 和 Agent 有什么区别？我应该用哪个？**
+A: RAG 适合**封闭世界**——答案在你给的资料里就能找到（公司文档、产品手册）；Agent 适合**开放世界**——答案需要"实时调外部世界"才能拿到（天气、汇率、订单状态）。**生产里复杂应用通常是 Agent 嵌套调 RAG**：Agent 把检索器当成它的工具之一。
+
+**Q: 三个子项目的数据/索引能共用吗？**
+A: 不能。它们各自维护 `storage/` / `data/`，相互独立。
 
 **Q: 必须用阿里云百炼吗？**
-A: 当前是。LLM 部分换成 OpenAI / Claude 改动量很小（替换 `_build_llm` 工厂即可）；Embedding 已经支持本地 HuggingFace BGE；Rerank 唯一依赖 DashScope，可以在 `.env` 里把 `RERANK_MODEL` 设成空字符串绕过（已有降级逻辑）。
+A: 当前是。LLM 部分换成 OpenAI / Claude 改动量很小（每个子项目都有 `llm.py` 或 `settings.py` 工厂函数）；Embedding 已支持本地 HuggingFace BGE；Rerank 唯一依赖 DashScope，可在 `.env` 里把 `RERANK_MODEL` 设空字符串绕过（已有降级逻辑）。
+
+**Q: Agent 项目不申请高德 Key 能用吗？**
+A: 能。地理编码、景点、路线都有免费数据源 fallback（Open-Meteo / Wikipedia / OSM），质量稍差但完整可用。
 
 **Q: Windows 下能跑吗？**
-A: 能，本项目就是在 Windows + PowerShell 下开发测试的。本 README 的命令示例都是 PowerShell 语法。
+A: 能，本仓库就是在 Windows + PowerShell 下开发测试的。所有命令示例都是 PowerShell 语法。
 
-**Q: 切换 embedding 模型后召回质量很差？**
+**Q: 切换 embedding 模型后 RAG 召回质量很差？**
 A: 不同 embedding 模型生成的向量在不同语义空间，必须**清空 `storage/chroma/` 重新 ingest**。直接复用旧索引会得到一堆噪音。
 
-**Q: 上传同一份文件没反应？**
-A: 是按内容 hash 去重的有意行为；改名上传也会被识别为同一文件。如果想强制重入，删掉 `storage/` 重来即可。
+**Q: Agent 项目偶尔超时？**
+A: DashScope 在调用大上下文（带 6 个工具 schema）时偶发 read timeout（5 分钟），属 ChatTongyi 默认配置；Streamlit 流式 UI 不会让人觉得卡。多刷一次或换 `qwen-turbo` 更快。
 
 ---
 
-## 10. 许可
+## 11. 许可
 
-本项目仅作学习用途，欢迎 fork、改造、用于内部知识库搭建。
-依赖的第三方库（LangChain / LlamaIndex / DashScope 等）请遵循它们各自的许可协议。
+本仓库仅作学习用途，欢迎 fork、改造、用于内部项目搭建。
+依赖的第三方库（LangChain / LlamaIndex / LangGraph / DashScope 等）请遵循它们各自的许可协议。
+
+---
+
+> 🌟 如果这个仓库对你有帮助，欢迎 Star。
+> 🐛 发现 bug 或想加新功能（比如把 OpenAI / Claude 接进去），欢迎提 Issue / PR。
