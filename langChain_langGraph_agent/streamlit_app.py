@@ -21,9 +21,10 @@ from pathlib import Path
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.agent import get_history, reset_thread, stream_agent
+from src.agent import get_history, reset_thread, stream_agent_tokens
 from src.config import settings
 from src.tools import ALL_TOOLS
+from src.usage import load_usage, summarize_total
 
 # ---------- 页面基础设置 ----------
 st.set_page_config(
@@ -144,6 +145,32 @@ with st.sidebar:
         st.markdown(f"- **{t.name}** —— {t.description.splitlines()[0][:40]}")
 
     st.divider()
+    st.markdown("### 📊 Token & 费用")
+    _total = summarize_total(st.session_state.active_thread_id)
+    _last_turn = st.session_state.get("last_turn_usage")
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("↑ 输入", f"{_total.get('input', 0):,}")
+    col_b.metric("↓ 输出", f"{_total.get('output', 0):,}")
+    col_c.metric("累计费用", f"¥{_total.get('cost_cny', 0.0):.4f}")
+    if _last_turn:
+        st.caption(
+            f"本轮：↑{_last_turn['input']:,} ↓{_last_turn['output']:,} tokens"
+            f"  ·  ¥{_last_turn['cost_cny']:.4f}"
+        )
+    with st.expander("📈 逐轮明细", expanded=False):
+        _usage_detail = load_usage(st.session_state.active_thread_id)
+        _turns = _usage_detail.get("turns", [])
+        if _turns:
+            st.caption(f"模型：`{_usage_detail.get('model', settings.LLM_MODEL)}`")
+            st.dataframe(
+                _turns[-20:][::-1],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("暂无用量记录。发一条消息试试～")
+
+    st.divider()
     with st.expander("🔌 数据源状态", expanded=False):
         st.write(f"DashScope LLM：{'✅' if settings.DASHSCOPE_API_KEY else '❌ 未配置'}")
         st.write(f"高德地图：{'✅ 已启用' if settings.has_amap else '⚪ 未配置（已 fallback）'}")
@@ -222,42 +249,71 @@ if prompt:
     with st.chat_message("user", avatar="🧑"):
         st.markdown(prompt)
 
-    # 2) Agent 流式响应
+    # 2) Agent 流式响应（token 级打字机 + 工具 trace + 用量）
     with st.chat_message("assistant", avatar="🧳"):
-        trace_box = st.expander("🔧 Agent 思考过程（实时）", expanded=st.session_state.show_trace)
+        trace_box = st.expander(
+            "🔧 Agent 思考过程（实时）", expanded=st.session_state.show_trace
+        )
         answer_box = st.empty()
 
         final_text = ""
+        turn_usage: dict | None = None
         try:
-            for event in stream_agent(prompt, thread_id=active_tid):
-                # event 形如 {"agent": {"messages": [...]}} 或 {"tools": {"messages": [...]}}
-                for node_name, node_state in event.items():
-                    new_msgs = node_state.get("messages", []) if isinstance(node_state, dict) else []
-                    for m in new_msgs:
-                        if isinstance(m, AIMessage):
-                            if getattr(m, "tool_calls", None):
-                                with trace_box:
-                                    st.markdown(f"🤔 决定调用 **{len(m.tool_calls)}** 个工具：")
-                                    for tc in m.tool_calls:
-                                        st.markdown(f"- `{tc['name']}` ← {tc.get('args', {})}")
-                            if m.content:
-                                final_text = m.content
-                                answer_box.markdown(final_text)
-                        elif isinstance(m, ToolMessage):
-                            with trace_box:
-                                st.markdown(f"📦 **{m.name}** 返回：")
-                                try:
-                                    parsed = (json.loads(m.content)
-                                              if isinstance(m.content, str) else m.content)
-                                    st.json(parsed, expanded=False)
-                                except Exception:
-                                    st.code(str(m.content)[:1500])
+            for ev in stream_agent_tokens(prompt, thread_id=active_tid):
+                ev_type = ev.get("type")
+
+                if ev_type == "token":
+                    # 真·token 级增量，累加并渲染带光标的文本
+                    final_text += ev["content"]
+                    answer_box.markdown(final_text + "▌")
+
+                elif ev_type == "tool_call":
+                    with trace_box:
+                        st.markdown(f"🤔 决定调用 **{ev['name']}**")
+                        st.json(ev.get("args", {}), expanded=False)
+
+                elif ev_type == "tool_result":
+                    with trace_box:
+                        st.markdown(f"📦 **{ev['name']}** 返回：")
+                        content = ev.get("content", "")
+                        try:
+                            parsed = (
+                                json.loads(content)
+                                if isinstance(content, str)
+                                else content
+                            )
+                            st.json(parsed, expanded=False)
+                        except Exception:
+                            st.code(str(content)[:1500])
+
+                elif ev_type == "usage":
+                    turn_usage = {
+                        "input": ev["input"],
+                        "output": ev["output"],
+                        "cost_cny": ev["cost_cny"],
+                    }
+
+                elif ev_type == "done":
+                    # 把尾部光标去掉
+                    if final_text:
+                        answer_box.markdown(final_text)
+                    elif ev.get("text"):
+                        final_text = ev["text"]
+                        answer_box.markdown(final_text)
         except Exception as e:
             st.error(f"调用 Agent 出错：{type(e).__name__}: {e}")
             raise
 
         if not final_text:
             answer_box.info("（本轮 Agent 未给出文本回答，请尝试换种问法）")
+
+        # 显示本轮 token/费用
+        if turn_usage:
+            st.caption(
+                f"📊 本轮：↑{turn_usage['input']:,} ↓{turn_usage['output']:,} tokens"
+                f"  ·  ¥{turn_usage['cost_cny']:.4f}"
+            )
+            st.session_state["last_turn_usage"] = turn_usage
 
     # 3) 一轮完成后强制 rerun，让"已完成"的对话以静态形式重排（去掉实时 placeholder）
     st.rerun()

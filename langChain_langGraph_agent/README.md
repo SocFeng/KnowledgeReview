@@ -37,10 +37,13 @@
 | 🛠 工具 | 6 个全部**自己实现**：geocode / weather / distance / search_attractions / lookup_culture / plan_route |
 | 🌐 数据源 | 优先免费无 key（OSM / Open-Meteo / Wikipedia），可选高德地图增强 |
 | 💬 对话 | 类聊天 UI（Streamlit），支持**多会话切换、重命名、删除** |
+| ⌨️ 真·token 流式 | 前端**打字机效果**：`stream_mode=["messages", "updates"]` 双通道，首 token ~2s 内抵达 |
+| 💰 Token / 成本统计 | 按轮次 / 按会话累计 `input_tokens` / `output_tokens` / 人民币费用，侧边栏实时显示 |
 | 🧠 记忆 | LangGraph **SqliteSaver checkpointer**，跨进程也能续聊 |
 | 🔧 可观测 | 工具调用 trace 实时展开（参数 + 返回 JSON） |
 | 🔁 上下文修改 | 用户随时改需求（"再加一天"、"去掉博物馆"），Agent 会基于历史增量调整 |
 | 🇨🇳 中文 LLM | 阿里云百炼 DashScope Qwen 系列（`qwen-plus` / `qwen-max` / ...） |
+| 🔌 LLM Provider 可切换 | 默认 **DashScope OpenAI 兼容端点 + `ChatOpenAI`**（流式 + tool_calls 稳定）；可切换回 `ChatTongyi` |
 
 ---
 
@@ -56,10 +59,11 @@ langChain_langGraph_agent/
 │
 ├── src/
 │   ├── config.py                   ← pydantic-settings 配置中心
-│   ├── llm.py                      ← LLM 工厂（ChatTongyi）
+│   ├── llm.py                      ← LLM 工厂（ChatOpenAI 兼容模式 / ChatTongyi 双轨）
 │   ├── prompts.py                  ← system prompt
 │   ├── state.py                    ← LangGraph TravelState
-│   ├── agent.py                    ← ⭐ StateGraph 编排 + checkpointer
+│   ├── usage.py                    ← ⭐ Token 用量 + 成本估算 + 按 thread 持久化
+│   ├── agent.py                    ← ⭐ StateGraph 编排 + checkpointer + 双 stream_mode
 │   └── tools/                      ← 自定义工具
 │       ├── _http.py                统一 HTTP 封装
 │       ├── geocode.py              地址 → 经纬度
@@ -200,7 +204,40 @@ g.add_edge("tools", "agent")       # 工具结果回到 agent，继续推理
 因为 messages 是被 checkpointer 自动累积的，所以"用户改需求"在 Agent 看来就是
 **对话历史里多了一句话**——LLM 自然会基于上下文做增量改动，无需任何特殊代码。
 
-### 6.4 教学版：手写 tool node
+### 6.4 真·token 流式 + 用量统计
+
+`src/agent.py` 中 `stream_agent_tokens()` 用 LangGraph 的**多 `stream_mode`** 能力同时订阅两种粒度：
+
+```python
+for mode, data in agent.stream(..., stream_mode=["messages", "updates"]):
+    if mode == "messages":
+        # AIMessageChunk：LLM 的 token 增量 → 前端打字机
+    elif mode == "updates":
+        # 节点级变更：工具调用、工具结果
+```
+
+外部迭代器统一 yield 出五种事件：`token` / `tool_call` / `tool_result` / `usage` / `done`，前端只认协议不关心底层。
+
+**Token 用量聚合**：一轮对话在 ReAct 里可能触发多次 LLM 调用，`_extract_usage()` 会同时兼容两种上报渠道：
+
+- `usage_metadata`（LangChain 0.3+ 标准，`ChatOpenAI` 默认走这里）
+- `response_metadata.token_usage`（`ChatTongyi` 实际使用的渠道）
+
+去重按 `request_id` —— 避免 messages 和 updates 两个通道把同一次响应的 usage 累加两遍。一轮结束时写入 `data/usage/{thread_id}.json` 并按 `PRICING` 表（`src/usage.py`）估算人民币费用。
+
+### 6.5 LLM Provider 双轨
+
+默认走 **DashScope OpenAI 兼容端点 + `ChatOpenAI`**（`LLM_PROVIDER=openai_compat`），原因：
+
+- `langchain_community.ChatTongyi` 在 `streaming=True` + `tool_calls` 场景下有个
+  [已知 bug](https://github.com/langchain-ai/langchain/issues)：
+  `subtract_client_response` 做增量 tool_call 对齐时会抛 `IndexError: list index out of range`。
+- `ChatOpenAI` 对 stream + tools 的实现非常成熟，搭配 DashScope 的 OpenAI 兼容接口，
+  就能同时拿到"真 token 流式 + tool calling 稳定 + usage_metadata 标准"。
+
+如需切回 ChatTongyi（比如做对照测试），把 `.env` 里 `LLM_PROVIDER=tongyi` 即可。**但不要再开 `streaming=True` + tool_calls**，否则就会踩那个 bug。
+
+### 6.6 教学版：手写 tool node
 
 `src/agent.py` 末尾保留了一份 `_manual_tool_node` 实现，与 `ToolNode` 等价但完全手写，
 方便理解"工具调用是如何被分发执行的"。生产路径用 `ToolNode`（自带并发 + 错误兜底）。
@@ -215,6 +252,22 @@ A: 能。地理编码、景点、路线都有免费数据源 fallback，质量�
 **Q: 为什么用 DashScope 而不是 OpenAI？**
 A: 这套项目是为国内环境设计的，DashScope 国内可直连且 Qwen 中文效果好。
 如果想换 OpenAI / Claude，只改 `src/llm.py` 的工厂函数即可，其余代码无变化。
+
+**Q: LLM_PROVIDER=openai_compat 和 tongyi 的区别？**
+A: 两者都走 DashScope 后端 + 同一个 Key，只是 LangChain 侧用哪个 wrapper。
+默认的 `openai_compat` 走 `ChatOpenAI` + DashScope 的 OpenAI 兼容端点
+(`https://dashscope.aliyuncs.com/compatible-mode/v1`)，**流式 + tool_calls 稳定**，
+能配合 `stream_usage=True` 在流式最后一 chunk 拿到 usage_metadata。
+`tongyi` 走 `ChatTongyi` + dashscope SDK，**在 streaming=True + tool_calls 下有上游 bug**
+（`IndexError` in `subtract_client_response`），保留仅作对照。
+
+**Q: Token 用量在哪里看？**
+A: Streamlit 侧边栏的 "📊 Token & 费用" 面板实时显示**当前会话**的累计 ↑输入 / ↓输出 / 人民币费用，
+展开 "📈 逐轮明细" 能看最近 20 轮的明细表。原始数据在 `data/usage/{thread_id}.json`，方便做跨会话分析。
+
+**Q: 定价表不准怎么办？**
+A: 直接改 `src/usage.py` 的 `PRICING` 字典。它按模型名前缀匹配（`qwen-max` / `qwen-plus` / ...），
+没匹配到的会 fallback 到 `_default`。DashScope 官方调价时更新这张表即可。
 
 **Q: 多个会话的数据存在哪？**
 A: `data/checkpoints.sqlite`（LangGraph checkpoint）+ `data/sessions.json`（前端用的标题等元信息）。

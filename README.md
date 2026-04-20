@@ -110,6 +110,9 @@
 | 🛠 自定义工具 | 6 个**全部自实现**：地理编码 / 天气 / 距离 / 景点 / 文化 / 路线 |
 | 🌐 数据源策略 | 优先**免费无 key**（Open-Meteo / Wikipedia / OSM），可选高德地图增强 |
 | 💬 类聊天 UI | Streamlit 多会话切换、重命名、删除 |
+| ⌨️ 真·token 流式 | 前端**打字机效果**：双 `stream_mode=["messages", "updates"]`，首 token ~2s 抵达 |
+| 💰 Token / 成本统计 | 按轮次 / 按会话累计 `input_tokens` / `output_tokens` / 人民币费用，侧边栏实时显示 |
+| 🔌 LLM Provider 可切换 | 默认 **DashScope OpenAI 兼容端点 + `ChatOpenAI`**（流式 + tool_calls 稳定），可切回 `ChatTongyi` |
 | 🧠 持久化记忆 | LangGraph **SqliteSaver checkpointer**，跨进程也能续聊 |
 | 🔧 可观测 | 工具调用 trace 实时展开（参数 + 返回 JSON） |
 | 🔁 上下文修改 | 用户随时改需求（"再加一天"、"去掉博物馆"），Agent 基于历史增量调整 |
@@ -121,7 +124,9 @@
 - **ReAct 框架**：Reason → Act → Observe 循环，靠 tool calling 协议落地
 - **LangGraph StateGraph**：节点 / 条件边 / cycle，区别于 LangChain 普通 DAG
 - **`@tool` 装饰器**：函数 → JSON Schema → LLM 可见
-- **`bind_tools()`**：让 ChatTongyi 兼容 OpenAI tool calling 协议
+- **`bind_tools()` 跨 Provider 兼容**：同一套业务代码配 `ChatOpenAI` / `ChatTongyi` / Claude 都能跑
+- **双 `stream_mode` 流式**：`["messages", "updates"]` 一次拿 token 增量 + 节点级工具 trace
+- **Token/成本聚合**：按 `request_id` 去重 + 兼容 `usage_metadata` / `response_metadata.token_usage` 两种上报渠道
 - **State + add_messages reducer**：多节点写同字段时合并而非覆盖
 - **Checkpointer 持久化**：thread_id 隔离会话、跨进程续聊
 - **Tool 失败哲学**：永不抛异常，返回 `{"error": "..."}` 让 LLM 自行换路
@@ -156,13 +161,14 @@ KnowledgeReview/
 │
 └── langChain_langGraph_agent/           ← 实现 3：Agent · LangChain + LangGraph
     ├── README.md                        用法说明 / 快速启动
-    ├── LEARNING.md                      ⭐ 学习路径文档（12 节、~970 行，标注全部 Agent 知识点）
+    ├── LEARNING.md                      ⭐ 学习路径文档（12 节、~1100 行，标注全部 Agent 知识点）
     ├── src/
-    │   ├── config.py                    配置中心
-    │   ├── llm.py                       ChatTongyi 工厂
+    │   ├── config.py                    配置中心（支持 LLM_PROVIDER 切换）
+    │   ├── llm.py                       LLM 工厂（ChatOpenAI 兼容模式 / ChatTongyi 双轨）
     │   ├── prompts.py                   System Prompt（含工作流约束）
     │   ├── state.py                     LangGraph State + add_messages
-    │   ├── agent.py                     ⭐⭐ StateGraph 编排：手写 ReAct loop + checkpointer
+    │   ├── usage.py                     ⭐ Token 用量 + 成本估算 + 按 thread 持久化
+    │   ├── agent.py                     ⭐⭐ StateGraph + 手写 ReAct + 双 stream_mode + checkpointer
     │   └── tools/                       6 个自定义工具
     │       ├── geocode.py / weather.py / distance.py
     │       └── attractions.py / culture.py / route.py
@@ -353,7 +359,13 @@ A: 能，本仓库就是在 Windows + PowerShell 下开发测试的。所有命�
 A: 不同 embedding 模型生成的向量在不同语义空间，必须**清空 `storage/chroma/` 重新 ingest**。直接复用旧索引会得到一堆噪音。
 
 **Q: Agent 项目偶尔超时？**
-A: DashScope 在调用大上下文（带 6 个工具 schema）时偶发 read timeout（5 分钟），属 ChatTongyi 默认配置；Streamlit 流式 UI 不会让人觉得卡。多刷一次或换 `qwen-turbo` 更快。
+A: DashScope 在调用大上下文（带 6 个工具 schema）时偶发 read timeout；切换到 `qwen-turbo` 更快。项目启用了真·token 流式，首字 ~2s 即可抵达，整体体感不卡。
+
+**Q: 想看本次对话花了多少 token？**
+A: Agent 项目的 Streamlit 侧边栏有"📊 Token & 费用"面板，实时显示 ↑ 输入 / ↓ 输出 / 人民币费用的累计值和逐轮明细。原始数据在 `langChain_langGraph_agent/data/usage/{thread_id}.json`。
+
+**Q: 为什么 Agent 项目默认不直接用 `ChatTongyi`？**
+A: `langchain_community.ChatTongyi` 在 `streaming=True` + `tool_calls` 场景下有上游 bug（`subtract_client_response` 抛 `IndexError`）。本项目默认改用 **DashScope 的 OpenAI 兼容端点 + `ChatOpenAI`**，后端依然是 Qwen，但流式 + 工具调用稳定得多，并且能走 LangChain 标准的 `usage_metadata` 统计 token。需要切回 ChatTongyi 做对照时，把 `.env` 里 `LLM_PROVIDER=tongyi` 即可。
 
 ---
 

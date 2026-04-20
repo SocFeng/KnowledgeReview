@@ -26,6 +26,9 @@
 8. **工具失败（404 / 超时 / SSL 抖动）** 时，为什么我们一律返回 `{"error": ...}` 而不是抛异常？这条原则对 LLM 推理有什么影响？
 9. **多源 fallback**（高德 → Open-Meteo → OSM）的设计权衡是什么？怎么避免"北京"被解析到重庆某村镇？
 10. **Streaming 的 `stream_mode="updates"`** 和 `stream_mode="values"` 区别在哪？为什么前端用 updates 更省带宽？
+11. **真·token 流式** 和 "节点级流式" 的本质区别？为什么同时订阅 `stream_mode=["messages", "updates"]` 能一次拿到两种粒度？
+12. **一轮对话里 LLM 可能被调多次**（ReAct 循环里 agent → tools → agent → ...），怎么把分散的 `usage_metadata` 正确聚合且不重复计数？
+13. **`ChatTongyi` 和 `ChatOpenAI + DashScope 兼容端点`** 做同一件事（调 Qwen），为什么本项目默认选后者？ChatTongyi 的 `_stream` 在 tool_calls 场景下的 bug 根因是什么？
 
 如果上面任何一题答不出来，就值得在对应章节多停留一会。
 
@@ -47,11 +50,12 @@ langChain_langGraph_agent/
 │
 ├── src/                    # 核心代码
 │   ├── config.py           # 1) 配置中心（pydantic-settings 读 .env）
-│   ├── llm.py              # 2) LLM 工厂（ChatTongyi 单例缓存）
+│   ├── llm.py              # 2) ⭐ LLM 工厂（双 Provider：ChatOpenAI 兼容模式 / ChatTongyi）
 │   ├── prompts.py          # 3) system prompt（含工作流强约束）
 │   ├── state.py            # 4) ⭐ LangGraph State 定义（add_messages reducer）
-│   ├── agent.py            # 5) ⭐⭐ StateGraph 编排：手写 ReAct loop + checkpointer
-│   └── tools/              # 6) ⭐ 6 个自定义工具
+│   ├── usage.py            # 5) ⭐ Token 用量 + 成本估算 + 按 thread 持久化
+│   ├── agent.py            # 6) ⭐⭐ StateGraph 编排：手写 ReAct loop + 双 stream_mode + checkpointer
+│   └── tools/              # 7) ⭐ 6 个自定义工具
 │       ├── _http.py        共用 HTTP（指数退避重试 + 浏览器 UA）
 │       ├── geocode.py      地址 → 经纬度（高德 → Open-Meteo → OSM 三档 fallback）
 │       ├── weather.py      Open-Meteo 未来 1~7 天天气
@@ -76,10 +80,10 @@ config.py ─→ llm.py
    tools/*.py（6 个独立工具，互不依赖）
                 │
                 ↓
-       prompts.py + state.py
+       prompts.py + state.py + usage.py
                 │
                 ↓
-              agent.py（核心编排）
+              agent.py（核心编排 + 双 stream_mode + usage 聚合）
                 │
                 ↓
    streamlit_app.py / scripts/chat_cli.py
@@ -235,31 +239,71 @@ LangGraph 默认有 `recursion_limit`（默认 25），但旅游规划只需 5~8
 
 ---
 
-### 4.2 `src/llm.py` —— LLM 工厂
+### 4.2 `src/llm.py` —— LLM 工厂（双 Provider）
 
 **这一节涉及的知识点：**
 - LangChain 的 `ChatTongyi`（Qwen 的 LangChain Wrapper）
-- DashScope SDK 的认证：通过环境变量 `DASHSCOPE_API_KEY`
+- `ChatOpenAI` + DashScope 的 **OpenAI 兼容端点** 调 Qwen
 - `lru_cache` 让多次调用不重复构造对象（轻量单例）
+- `streaming=True` 时，LangGraph 的 `stream_mode="messages"` 才能拿到 token 级 `AIMessageChunk`
+- `stream_usage=True`：强制 `ChatOpenAI` 流式最后一 chunk 返回 `usage_metadata`
 
 ```python
 @lru_cache(maxsize=4)
-def get_llm(streaming: bool = False, temperature: float | None = None):
-    return ChatTongyi(
-        model=settings.LLM_MODEL,
-        dashscope_api_key=settings.DASHSCOPE_API_KEY,
-        temperature=settings.LLM_TEMPERATURE,
-        streaming=streaming,
-    )
+def get_llm(streaming: bool = True, temperature: float | None = None):
+    provider = (settings.LLM_PROVIDER or "openai_compat").lower()
+    if provider in ("openai_compat", "openai", "compat"):
+        return ChatOpenAI(
+            model=settings.LLM_MODEL,
+            api_key=settings.DASHSCOPE_API_KEY,
+            base_url=settings.LLM_BASE_URL,   # DashScope OpenAI 兼容端点
+            temperature=temperature,
+            streaming=streaming,
+            stream_usage=True,                # ⭐ 打开 usage 流式返回
+        )
+    if provider in ("tongyi", "dashscope"):
+        return ChatTongyi(..., streaming=streaming)
+    raise ValueError(...)
 ```
 
-**为什么 ChatTongyi 能用 OpenAI 风格的 tool calling？**
+#### 为什么默认 `openai_compat` 而不是 `tongyi`？
+
+一个**真实踩坑**：在 `streaming=True` + LLM 决定调工具的场景下，`langchain_community.ChatTongyi._stream` 会抛：
+
+```
+File "...langchain_community/chat_models/tongyi.py", line 602
+    prev_function = prev_message["tool_calls"][index]["function"]
+IndexError: list index out of range
+```
+
+**根因**：DashScope 原生 API 在流式返回 tool_calls 时，片段 1 可能只有 1 个 tool_call，片段 2 追加到 2 个。`ChatTongyi.subtract_client_response` 做增量合并时假设新旧片段 `tool_calls` 数组对齐，于是 `prev[index]` 越界。
+
+解决方案**不是自己 patch ChatTongyi**（上游修复不可控），而是绕开这条路径：
+
+- DashScope 官方还提供一个 **OpenAI 兼容端点**：`https://dashscope.aliyuncs.com/compatible-mode/v1`
+- 搭配 `langchain_openai.ChatOpenAI` 即可，`ChatOpenAI` 的 stream + tools 实现非常成熟
+- 后端仍然是 Qwen，计费和模型能力完全一致
+
+**代价**：多一个 `langchain-openai` 依赖；**收益**：streaming 稳定 + usage_metadata 走 LangChain 标准字段 + 未来要切真·OpenAI / 本地 vLLM 也无需改动。
+
+> 🧠 **知识点**：选 LLM wrapper 时，不要只看"是不是原生 SDK"。**跟随 LangChain 标准实现（`ChatOpenAI`）往往比官方特化 wrapper 更稳**，因为前者经过最多生产流量验证。
+
+#### `bind_tools()` 是怎么跨 Provider 兼容的？
 
 LangChain 的 `BaseChatModel.bind_tools()` 是**统一抽象**——所有 ChatModel 都按 OpenAI 的 tool 协议把工具转成 LLM 可见的 schema，发给后端时再由各家 wrapper 翻译成自己平台的 API 格式。
 
-DashScope 自己的 Generation API 已经原生支持 OpenAI 风格的 tools 字段（Qwen 系列 2.5+ 都支持），所以 LangChain 几乎是直传。
+- `ChatOpenAI` → HTTP POST 到兼容端点，tools 字段直传
+- `ChatTongyi` → dashscope SDK，内部转成 DashScope 原生 tools 字段
+
+两者最终都能让 Qwen 按 OpenAI tool calling 协议返回 `tool_calls`，所以 **Agent 业务代码一行都不用改**。
 
 > 🧠 **知识点**：LangChain ChatModel 抽象的核心价值就是 **tool calling 协议统一**——你换 OpenAI / Claude / Qwen，业务代码不用改一行。
+
+#### `stream_usage=True` 的小陷阱
+
+`ChatOpenAI(streaming=True)` 默认**不会**在流式模式下返回 token 用量（出于向后兼容）。必须显式传 `stream_usage=True`，才会让最后一个 `AIMessageChunk` 带 `usage_metadata`。这对我们的费用统计是必需的，忽略它你会得到 "in=0, out=0, cost=¥0" 的假数据。
+
+> 🧠 **知识点**：流式 + usage 是"两件事"，很多 wrapper 默认只给流式不给 usage，用前务必查 wrapper 文档。
 
 ---
 
@@ -667,11 +711,21 @@ config = {
 
 `recursion_limit` 是 LangGraph 防死循环的硬限制——节点跑了这么多步还没到 END 就抛 `GraphRecursionError`。乘 2 是因为 ReAct 循环每次走 agent + tools 两个节点。
 
-#### 4.6.7 流式接口 `stream_agent`
+#### 4.6.7 流式接口：`stream_agent` vs `stream_agent_tokens`
+
+LangGraph 的 `stream_mode` 有四种粒度，前三种在本项目里用得到：
+
+| mode | 每个 event 内容 | 延迟 | 适用场景 |
+|---|---|---|---|
+| `"values"` | 整个 state 的最新值 | 节点级 | 调试，能看到全量 |
+| `"updates"` | 每个节点新增的字段 | 节点级 | 工具 trace（哪个节点跑完了） |
+| `"messages"` | 逐 token 的 `(AIMessageChunk, metadata)` | **token 级** | "打字机"式输出 |
+| `"custom"` | 节点内手动 emit 的事件 | 任意 | 复杂场景，本项目未用 |
+
+##### 版本 1：仅节点级（保留）
 
 ```python
 def stream_agent(user_message, thread_id, persistent=True):
-    config = {...}
     with open_agent(persistent) as agent:
         for event in agent.stream(
             {"messages": [HumanMessage(content=user_message)]},
@@ -681,21 +735,171 @@ def stream_agent(user_message, thread_id, persistent=True):
             yield event
 ```
 
-`stream_mode` 三种值：
+问题：最终回答要等 `_agent_node` 整个 LLM 调用完才 emit，用户要等 10~15s 才看到第一个字。
 
-| mode | 每个 event 内容 | 适用场景 |
+##### 版本 2：真·token 流式（`stream_agent_tokens`）
+
+**关键语法：`stream_mode` 可以传一个 list，同时订阅多种粒度**。每个 event 变成 `(mode, data)` tuple，由消费方分发：
+
+```python
+for mode, data in agent.stream(..., stream_mode=["messages", "updates"]):
+    if mode == "messages":
+        # data = (AIMessageChunk, metadata_dict)
+        chunk, meta = data
+        # chunk.content 是 token 增量；chunk.usage_metadata 通常只在最后一个 chunk 上
+    elif mode == "updates":
+        # data = {"agent": {"messages": [AIMessage]}} 或 {"tools": {"messages": [ToolMessage]}}
+```
+
+**为什么要两种都订阅**？因为单一模式各有缺失：
+
+| 只订 `messages` | 只订 `updates` | 同时订阅（本项目） |
 |---|---|---|
-| `"values"` | 整个 state 的最新值 | 调试，能看到全量 |
-| `"updates"` | 每个节点新增的字段 | **前端**，省带宽 |
-| `"messages"` | 逐 token 的 AIMessage stream | 真正的"打字机"流式输出 |
+| ✅ 打字机 token | ❌ 不知道哪些工具被调 | ✅ 打字机 token |
+| ❌ 拿不到 ToolMessage（工具结果） | ✅ 节点级工具 trace | ✅ 节点级工具 trace |
+| ❌ 拿不到 tool_call 决策 | ❌ 没有字符增量 | ✅ tool_call 决策 |
 
-本项目前端用 `"updates"`：每次只拿到节点新增的 message（一个 AIMessage 或几个 ToolMessage），渲染快、不用 diff。
+本项目把双流**归一化**成对前端友好的 5 种事件类型（见下）：
 
-> 🧠 **知识点**：LangGraph 的 streaming 三种粒度，按需选；不是流式 token 就是"打字机"，updates 也是流式。
+```python
+yield {"type": "token", "content": "今天", "node": "agent"}
+yield {"type": "tool_call", "name": "get_weather_forecast", "args": {...}, "id": "call_x"}
+yield {"type": "tool_result", "name": "get_weather_forecast", "content": "{...}"}
+yield {"type": "usage", "input": 1823, "output": 256, "cost_cny": 0.0018}
+yield {"type": "done", "text": "..."}
+```
+
+Streamlit 侧只要 `if ev["type"] == "token":` 就能做打字机，完全不用关心底层 `AIMessageChunk` 是什么。这就是**协议归一化**的价值——业务代码和 LangGraph API 解耦。
+
+##### token 级流式的前提条件
+
+只有 `LLM.streaming=True` 时，`stream_mode="messages"` 才会真正 emit 字符级 chunk。否则 LangGraph 会把整条 AIMessage 当成一个大 chunk 发出——能跑通但失去打字机效果。这是 `src/llm.py` 默认 `streaming=True` 的原因。
+
+> 🧠 **知识点**：LangGraph 的 `stream_mode` 支持传列表，这是"一次拿多种粒度"的官方推荐做法，无需自己起多个 stream。
 
 ---
 
-### 4.7 `streamlit_app.py` —— 前端 UI
+### 4.7 `src/usage.py` —— Token 用量 + 成本统计
+
+**这一节涉及的知识点：**
+- LangChain 的 `usage_metadata` 标准字段（`input_tokens` / `output_tokens` / `total_tokens`）
+- 为什么"在 agent 层"聚合 usage，而不是在 LLM 层或节点层
+- ReAct 循环里一轮对话会触发**多次 LLM 调用**，怎么避免重复计数
+- 按模型名前缀匹配的定价表设计
+
+#### 4.7.1 为什么需要这个模块？
+
+没有它，**按量付费心里完全没数**：一条看似简单的"北京去天津玩两天"可能触发 3 次 LLM 调用（每次带 6 个工具 schema + 累积的 messages），每轮 8000+ tokens 不是罕见事。
+
+大规模跑起来后，不做用量统计你会面对三个问题：
+
+1. **哪些用户最烧钱？**（可能是某个用户一直问大范围规划）
+2. **哪些会话需要被截断？**（上下文越积越长，成本呈二次方增长）
+3. **换 `qwen-max` 还是继续用 `qwen-plus` 划算？**（max 输出单价是 plus 的 30 倍）
+
+#### 4.7.2 设计：价格表 + 按 thread 持久化
+
+```python
+PRICING: dict[str, dict[str, float]] = {
+    "qwen-max":   {"input": 0.02,   "output": 0.06},
+    "qwen-plus":  {"input": 0.0008, "output": 0.002},
+    "qwen-turbo": {"input": 0.0003, "output": 0.0006},
+    ...
+    "_default":   {"input": 0.001,  "output": 0.002},
+}
+
+def compute_cost(input_tokens, output_tokens, model):
+    price = get_pricing(model)   # 前缀匹配，未命中走 _default
+    return (input_tokens * price["input"] + output_tokens * price["output"]) / 1000
+```
+
+**为什么按模型名前缀匹配**？DashScope 的模型名经常带变体（`qwen-plus-2025-04-28`、`qwen-plus-latest`），前缀匹配让定价表不用每出一个变体就加一行。
+
+**为什么按 thread 持久化**（`data/usage/{thread_id}.json`）而不是统计全局？
+
+- **每个会话独立**：用户 A 的烧钱和用户 B 无关
+- **侧边栏直接能读**：Streamlit 切换 thread 时重新加载对应文件即可
+- **清空会话连带清 usage**：`reset_thread` 同步调用 `reset_usage`，数据一致
+
+#### 4.7.3 核心陷阱：ReAct 循环里**多次 LLM 调用**的去重
+
+一轮用户输入，Agent 可能这样跑：
+
+```
+agent（LLM 调用 1：决定调 weather + geocode） → tools → agent（LLM 调用 2：整合成答案）
+```
+
+两次 LLM 调用各自产生一个 `usage_metadata`，**都要累加**才是"本轮总成本"。但问题来了——我们同时订阅了 `messages` 和 `updates` 两种 stream 模式，**同一次 LLM 响应的 usage 会在两处都出现**：
+
+- `messages` 模式的最后一个 `AIMessageChunk.usage_metadata`（或 `response_metadata.token_usage`）
+- `updates` 模式里整条 `AIMessage.usage_metadata`
+
+如果不去重，每次 LLM 调用的 usage 会被累加两遍。
+
+解决方案：按 `response_metadata.request_id` 去重（每次 LLM 调用的 request_id 唯一）：
+
+```python
+counted_req_ids: set[str] = set()
+
+def _extract_usage(m):
+    # 兼容 usage_metadata（LangChain 标准）和 response_metadata.token_usage（ChatTongyi）
+    ...
+    return in_tok, out_tok, req_id
+
+# 不管从 messages 还是 updates 过来，都先查 req_id
+in_tok, out_tok, req_id = _extract_usage(chunk_or_message)
+if (in_tok or out_tok) and req_id not in counted_req_ids:
+    counted_req_ids.add(req_id)
+    total_input += in_tok
+    total_output += out_tok
+```
+
+> 🧠 **知识点**：**同一信息从多个流出现是并发/多通道系统的常态**。去重主键（这里是 request_id）必须在事件生成方提供，消费方只做幂等累加。
+
+#### 4.7.4 两种上报渠道的兼容
+
+ChatOpenAI 和 ChatTongyi 对 usage 的上报渠道**不一样**——不是所有 wrapper 都走 LangChain 标准：
+
+| Wrapper | usage 在哪 | 标准渠道 |
+|---|---|---|
+| `ChatOpenAI` (0.3+) | `AIMessageChunk.usage_metadata = {"input_tokens": ..., "output_tokens": ...}` | ✅ LangChain 标准 |
+| `ChatTongyi` | `response_metadata["token_usage"] = {"input_tokens": ..., "output_tokens": ...}` | ❌ 放在 response_metadata 下 |
+
+所以 `_extract_usage` 必须同时查两个位置：
+
+```python
+um = getattr(m, "usage_metadata", None)
+if isinstance(um, dict):
+    in_tok = int(um.get("input_tokens", 0) or 0)
+    out_tok = int(um.get("output_tokens", 0) or 0)
+if in_tok == 0 and out_tok == 0:
+    # 回退：查 response_metadata.token_usage
+    rm = getattr(m, "response_metadata", {})
+    tu = rm.get("token_usage") if isinstance(rm, dict) else None
+    ...
+```
+
+> 🧠 **知识点**：LangChain 0.3 推出了 `usage_metadata` 标准字段，但**老 wrapper 迁移不完整**。写 usage 统计时一定要兼容两条路径，否则换 provider 时会神秘地变成 0。
+
+#### 4.7.5 最后一笔小账：何时 emit `usage` 事件？
+
+`stream_agent_tokens` 在整个 `agent.stream(...)` 迭代完后才 emit 一次 `type=usage` 事件（代表本轮累计）：
+
+```python
+# stream 循环结束后
+if total_input or total_output:
+    turn = _save_usage_turn(thread_id, total_input, total_output)  # 写盘 + 追加到 turns
+    yield {"type": "usage", "input": turn["input"], "output": turn["output"], "cost_cny": turn["cost_cny"]}
+yield {"type": "done", "text": "".join(final_text_parts)}
+```
+
+这样前端能在"回答生成完的那一刻"同时拿到：
+1. 完整文本（打字机收尾去掉光标 `▌`）
+2. 本轮花费
+
+---
+
+### 4.8 `streamlit_app.py` —— 前端 UI
 
 要点（不是教 Streamlit 用法，是讲为什么这么组织）：
 
@@ -712,13 +916,32 @@ def stream_agent(user_message, thread_id, persistent=True):
    
    注意我们没有自己维护一份"对话历史"——直接从 checkpointer 读，这样和真实状态永远一致。
 
-3. **Trace 实时渲染**：消费 `stream_agent` 的 event 流时，分别处理 AIMessage（看 tool_calls）和 ToolMessage（看返回 JSON），分别画到 trace expander 和主回答 box。
+3. **打字机式流式渲染**：消费 `stream_agent_tokens` 的事件流：
 
-4. **`st.rerun()` 在一轮完成后**：把"实时占位"的 placeholder 清掉，让历史对话以静态形式重排。这是 Streamlit 流式 UI 的常见模式。
+   ```python
+   for ev in stream_agent_tokens(prompt, thread_id=active_tid):
+       if ev["type"] == "token":
+           final_text += ev["content"]
+           answer_box.markdown(final_text + "▌")   # 光标
+       elif ev["type"] == "tool_call":
+           with trace_box: st.markdown(...)
+       elif ev["type"] == "tool_result":
+           with trace_box: st.json(...)
+       elif ev["type"] == "usage":
+           turn_usage = {...}
+   # 收尾去光标
+   answer_box.markdown(final_text)
+   ```
+   
+   用 `st.empty()` 的 placeholder 反复覆盖是 Streamlit 流式 UI 的标准套路；`▌` 这种"光标"细节显著提升感知上的"正在打字"感。
+
+4. **侧边栏 Token 面板**：用 `st.metric` 展示累计 ↑/↓/费用；`st.dataframe` 显示最近 20 轮明细，让用户一眼看出"哪轮贵"。
+
+5. **`st.rerun()` 在一轮完成后**：把"实时占位"的 placeholder 清掉，让历史对话以静态形式重排。这是 Streamlit 流式 UI 的常见模式。
 
 ---
 
-### 4.8 `scripts/diagnose.py` —— 体检脚本
+### 4.9 `scripts/diagnose.py` —— 体检脚本
 
 这种脚本在生产 Agent 项目里**强烈建议每个都有**。因为：
 
@@ -866,7 +1089,10 @@ LLM 上下文窗口里能看到：
 | **Checkpointer** | §4.6.5 | 自动在每个节点后 dump state 到 sqlite，支持跨进程续聊 |
 | **thread_id** | §4.6.5 | 类似 Git branch，区分不同会话 |
 | **recursion_limit** | §4.6.6 | 防死循环的硬上限 |
-| **Streaming modes** | §4.6.7 | `values` / `updates` / `messages` 三种粒度 |
+| **Streaming modes** | §4.6.7 | `values` / `updates` / `messages` 三种粒度；**可以传 list 同时订阅多种** |
+| **真·token 流式** | §4.6.7 | `stream_mode=["messages", "updates"]` 双通道 + 归一化事件协议 |
+| **Token/成本统计** | §4.7 | request_id 去重 + 多渠道 usage 兼容 + 按 thread 持久化 |
+| **LLM Provider 可切换** | §4.2 | `ChatOpenAI + 兼容端点` 优先于 `ChatTongyi`（后者 stream+tools 有 bug） |
 | **System prompt 工程** | §4.4 | Agent 的 prompt = 工作流约束 + 失败兜底语义 |
 | **Tool 失败哲学** | §4.3.3 | 永不抛异常，返回 `{"error": ...}` |
 | **多源 fallback** | §4.3.4 | 关键不是"调多少 API"，而是结果质量怎么排序选优 |
@@ -901,7 +1127,11 @@ LLM 上下文窗口里能看到：
 
 8. 给 `src/agent.py` 加一个 "summarize" 节点：当 messages 数 > 20 时，自动调一次 LLM 把老对话压缩成 SystemMessage 摘要（替代老 messages）。
 
-9. 接入 [LangSmith](https://smith.langchain.com/)：在 `src/llm.py` 的 ChatTongyi 实例化时加 `tags=["travel-agent"]`，把 trace 发到云端。然后看完整的 ReAct 决策图。
+9. 接入 [LangSmith](https://smith.langchain.com/)：在 `src/llm.py` 的 Chat 实例化时加 `tags=["travel-agent"]`，把 trace 发到云端。然后看完整的 ReAct 决策图。
+
+10. 把 `src/usage.py` 改造成 **SQLite** 存储（建一张 `usage` 表，schema：`thread_id, ts, model, input_tokens, output_tokens, cost_cny`）。好处：可以跨 thread 做聚合查询 —— "过去 7 天各模型总开销"、"最烧钱的前 10 个 thread"。
+
+11. 在 `.env` 里切换 `LLM_PROVIDER=tongyi` + `streaming=False`（改一下 `llm.py`），用 `scripts/chat_cli.py` 跑一轮有工具调用的问题，对比延迟和 token 用量。**思考**：为什么 ChatTongyi 非流式反而能跑通 tool_calls？它的 `_generate`（非流式）和 `_stream` 走的是两套代码路径吗？
 
 ### Level 4：架构
 

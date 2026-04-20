@@ -23,7 +23,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -34,6 +40,7 @@ from .llm import get_llm
 from .prompts import SYSTEM_PROMPT
 from .state import TravelState
 from .tools import ALL_TOOLS
+from .usage import save_turn as _save_usage_turn
 
 # 工具按 name -> tool 建索引（备用，目前 ToolNode 已经接管了执行）
 TOOL_NAME_MAP = {t.name: t for t in ALL_TOOLS}
@@ -115,9 +122,10 @@ def stream_agent(
     *,
     persistent: bool = True,
 ) -> Iterable[dict[str, Any]]:
-    """以流式方式跑一次对话。
+    """以流式方式跑一次对话（节点级 updates）。
 
     yield 出 LangGraph 的原生 stream event，前端可以基于此渲染 trace。
+    历史原因保留；新代码推荐 :func:`stream_agent_tokens`，能拿到 token 级增量。
     """
     from langchain_core.messages import HumanMessage
 
@@ -130,6 +138,152 @@ def stream_agent(
             stream_mode="updates",
         ):
             yield event
+
+
+def stream_agent_tokens(
+    user_message: str,
+    thread_id: str,
+    *,
+    persistent: bool = True,
+) -> Iterable[dict[str, Any]]:
+    """真·token 流式 + 工具 trace + 用量统计 三合一迭代器。
+
+    利用 LangGraph 的多 stream_mode 能力（``["messages", "updates"]``）同时拿到：
+
+    - ``messages`` 模式：LLM 产生的 ``AIMessageChunk`` 增量，用来做打字机效果；
+    - ``updates`` 模式：节点级变更，用来呈现 "决定调用哪些工具" 和工具返回。
+
+    为了让前端只关心渲染不关心底层协议，这里再做一层归一化，yield 出固定结构：
+
+    - ``{"type": "token", "content": str, "node": str}``
+        最终回答（或中间思考）的一段增量文本。
+    - ``{"type": "tool_call", "name": str, "args": dict, "id": str}``
+        Agent 决定调用某个工具（整体）。
+    - ``{"type": "tool_result", "name": str, "content": str}``
+        工具执行返回。
+    - ``{"type": "usage", "input": int, "output": int, "cost_cny": float}``
+        本轮 token 用量 + 估算的人民币费用（仅一次，最后）。
+    - ``{"type": "done", "text": str}``
+        本轮结束标记，附最终累计文本。
+    """
+    from langchain_core.messages import HumanMessage
+
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": settings.MAX_TOOL_ITERATIONS * 2 + 4,
+    }
+
+    # usage 聚合：一轮里 LLM 可能被调多次（ReAct 循环），全部累加
+    total_input = 0
+    total_output = 0
+    final_text_parts: list[str] = []
+    seen_tool_calls: set[str] = set()
+    # 按 request_id 去重，防止同一条 LLM 响应的 usage 被统计两遍（例如
+    # messages 模式末尾的 chunk 和 updates 模式的整条 AIMessage 来自同一请求）
+    counted_req_ids: set[str] = set()
+
+    def _extract_usage(m: Any) -> tuple[int, int, str | None]:
+        """从消息对象上抽出 (input_tokens, output_tokens, request_id)。
+
+        兼容两种上报渠道：
+        - ``usage_metadata``（LangChain 0.3+ 标准字段）
+        - ``response_metadata.token_usage``（ChatTongyi 走的实际渠道）
+        """
+        in_tok = 0
+        out_tok = 0
+        um = getattr(m, "usage_metadata", None)
+        if isinstance(um, dict):
+            in_tok = int(um.get("input_tokens", 0) or 0)
+            out_tok = int(um.get("output_tokens", 0) or 0)
+        if in_tok == 0 and out_tok == 0:
+            rm = getattr(m, "response_metadata", None) or {}
+            tu = rm.get("token_usage") if isinstance(rm, dict) else None
+            if isinstance(tu, dict):
+                in_tok = int(tu.get("input_tokens", tu.get("prompt_tokens", 0)) or 0)
+                out_tok = int(tu.get("output_tokens", tu.get("completion_tokens", 0)) or 0)
+        rm = getattr(m, "response_metadata", None) or {}
+        req_id = rm.get("request_id") if isinstance(rm, dict) else None
+        return in_tok, out_tok, req_id
+
+    with open_agent(persistent) as agent:
+        for mode, data in agent.stream(
+            {"messages": [HumanMessage(content=user_message)]},
+            config=config,
+            stream_mode=["messages", "updates"],
+        ):
+            # ---------- 1) token 级增量 ----------
+            if mode == "messages":
+                # LangGraph messages 模式 yield (AIMessageChunk, metadata_dict)
+                chunk, meta = data if isinstance(data, tuple) else (data, {})
+                node_name = (meta or {}).get("langgraph_node", "")
+
+                if isinstance(chunk, AIMessageChunk):
+                    # content 可能是 "" 或 None（首 chunk 只带 role）
+                    text = chunk.content or ""
+                    if isinstance(text, list):
+                        # 极少数 provider 会把 content 编成 part list
+                        text = "".join(
+                            p.get("text", "") if isinstance(p, dict) else str(p)
+                            for p in text
+                        )
+                    if text:
+                        final_text_parts.append(text)
+                        yield {"type": "token", "content": text, "node": node_name}
+
+                    # usage 通常挂在"最后一个 chunk"，两种渠道都试一下
+                    in_tok, out_tok, req_id = _extract_usage(chunk)
+                    if (in_tok or out_tok) and req_id not in counted_req_ids:
+                        if req_id:
+                            counted_req_ids.add(req_id)
+                        total_input += in_tok
+                        total_output += out_tok
+
+            # ---------- 2) 节点级更新（工具调用 / 结果 / 兜底 usage）----------
+            elif mode == "updates":
+                if not isinstance(data, dict):
+                    continue
+                for node_name, node_state in data.items():
+                    if not isinstance(node_state, dict):
+                        continue
+                    for m in node_state.get("messages", []):
+                        if isinstance(m, AIMessage):
+                            # tool_calls 以"完整一次决策"的形式冒出来
+                            for tc in getattr(m, "tool_calls", None) or []:
+                                cid = tc.get("id") or f"{tc.get('name')}-{len(seen_tool_calls)}"
+                                if cid in seen_tool_calls:
+                                    continue
+                                seen_tool_calls.add(cid)
+                                yield {
+                                    "type": "tool_call",
+                                    "name": tc.get("name", ""),
+                                    "args": tc.get("args", {}),
+                                    "id": cid,
+                                }
+                            # 若 messages 模式没带 usage（ChatTongyi 经常不给），这里兜底
+                            in_tok, out_tok, req_id = _extract_usage(m)
+                            if (in_tok or out_tok) and req_id not in counted_req_ids:
+                                if req_id:
+                                    counted_req_ids.add(req_id)
+                                total_input += in_tok
+                                total_output += out_tok
+                        elif isinstance(m, ToolMessage):
+                            yield {
+                                "type": "tool_result",
+                                "name": m.name,
+                                "content": m.content,
+                            }
+
+    # ---------- 3) 收尾：持久化 usage + emit 汇总 ----------
+    if total_input or total_output:
+        turn = _save_usage_turn(thread_id, total_input, total_output)
+        yield {
+            "type": "usage",
+            "input": turn["input"],
+            "output": turn["output"],
+            "cost_cny": turn["cost_cny"],
+        }
+
+    yield {"type": "done", "text": "".join(final_text_parts)}
 
 
 def invoke_agent(
@@ -160,26 +314,30 @@ def get_history(thread_id: str) -> list[BaseMessage]:
 
 
 def reset_thread(thread_id: str) -> None:
-    """清空某个 thread 的历史。直接 delete 这个 thread 的所有 checkpoint。"""
+    """清空某个 thread 的历史。直接 delete 这个 thread 的所有 checkpoint，
+    同时清空对应的 token 用量记录。"""
+    from .usage import reset_usage
+
     db_path = settings.checkpoint_db_path
-    if not Path(db_path).exists():
-        return
-    conn = sqlite3.connect(str(db_path))
-    try:
-        # SqliteSaver 默认表名：checkpoints / writes
-        for table in ("checkpoints", "writes"):
-            try:
-                conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
-            except sqlite3.OperationalError:
-                pass
-        conn.commit()
-    finally:
-        conn.close()
+    if Path(db_path).exists():
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # SqliteSaver 默认表名：checkpoints / writes
+            for table in ("checkpoints", "writes"):
+                try:
+                    conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
+                except sqlite3.OperationalError:
+                    pass
+            conn.commit()
+        finally:
+            conn.close()
+    reset_usage(thread_id)
 
 
 __all__ = [
     "open_agent",
     "stream_agent",
+    "stream_agent_tokens",
     "invoke_agent",
     "get_history",
     "reset_thread",

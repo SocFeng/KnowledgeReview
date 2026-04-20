@@ -7,7 +7,10 @@ langgraph-checkpoint>=2.0.0
 langgraph-checkpoint-sqlite>=2.0.0
 
 # ===== LLM Provider：阿里云 DashScope（Qwen） =====
-# ChatTongyi 在 langchain-community；底层走 dashscope SDK
+# 默认走 DashScope 的 OpenAI 兼容端点 + ChatOpenAI
+#   （stream + tool_calls 更稳定，避开 ChatTongyi _stream 的已知 bug）
+# ChatTongyi + dashscope SDK 保留作为 fallback
+langchain-openai>=0.2.0,<0.4.0
 dashscope>=1.20.0
 
 # ===== HTTP 工具调用 =====

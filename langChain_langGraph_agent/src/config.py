@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     DASHSCOPE_API_KEY: str = Field(default="", description="阿里云百炼 API Key")
     LLM_MODEL: str = Field(default="qwen-plus")
     LLM_TEMPERATURE: float = Field(default=0.5)
+    # LLM Provider 选择：
+    #   "openai_compat"（默认，推荐）— 走 DashScope OpenAI 兼容端点，流式 + tool_calls 稳定
+    #   "tongyi"                   — 走 langchain-community ChatTongyi（流式 + tool_calls 有已知 bug）
+    LLM_PROVIDER: str = Field(default="openai_compat")
+    LLM_BASE_URL: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        description="OpenAI 兼容端点；默认指向 DashScope",
+    )
 
     # --- 第三方工具 ---
     AMAP_API_KEY: str = Field(default="", description="高德地图 Web 服务 Key（可选）")
